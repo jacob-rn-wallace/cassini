@@ -51,27 +51,42 @@ not a conflict with, this project's own GPL-3.0 terms.
 
 ## Current status
 
-**Phase 1 (vendor the core) and most of Phase 2 (native host smoke
-test) are done; no hardware bring-up has happened yet.** `saturnng` was
-selected after cloning and reading both candidates directly, and is
-vendored at `saturn_core/` as a pinned git submodule (see "The Saturn
-CPU core" below). On top of that, `firmware/saturn_compat/` now has
-real shim code — a from-scratch, bare-metal-portable implementation of
-the five-function libChf surface (`ChfStaticInit`/`ChfGenerate`/
-`ChfPushHandler`/`ChfSignal`/`ChfExit`) `saturn_core/src/core/` calls
-through `chf_wrapper.h`'s macros, plus the `ui4x_config` global and
+**Phase 1 (vendor the core) and Phase 2 (native host smoke test,
+including a real ROM run) are done. Phase 3 (Sharp display bring-up) is
+also done at the build level; no physical hardware bring-up has
+happened yet.** `saturnng` was selected after cloning and reading both
+candidates directly, and is vendored at `saturn_core/` as a pinned git
+submodule (see "The Saturn CPU core" below). On top of that,
+`firmware/saturn_compat/` has real shim code — a from-scratch,
+bare-metal-portable implementation of the five-function libChf surface
+(`ChfStaticInit`/`ChfGenerate`/`ChfPushHandler`/`ChfSignal`/`ChfExit`)
+`saturn_core/src/core/` calls through `chf_wrapper.h`'s macros, plus the
+`ui4x_config` global and
 `ui4x_make_filename_absolute_for_loading/saving()` callbacks that stand
 in for the deliberately-uninitialized `ui4x` submodule — and
 `tests/saturn_smoke_test.c` + `tests/Makefile` build and link the
 vendored core against those shims into a real host binary
 (`make -C tests run ROM=... MODEL=48sx`). It's been run end to end
-against both a missing-optional-state path (WARNING, falls through to
-a clean `CpuReset()`, exactly as intended) and a missing-ROM path
-(FATAL, clean `exit(1)`) — real evidence the wiring is correct — but
-not yet against an actual HP48SX/HP48GX ROM dump, since none exists on
-this machine and ROMs are BYO by policy (see `roms/README.md`). See
-"Native (host) tests" below for how to finish that validation once a
-real ROM is available.
+against a missing-optional-state path (WARNING, falls through to a
+clean `CpuReset()`), a missing-ROM path (FATAL, clean `exit(1)`), and
+now a real HP48SX revision J ROM dump — full `PASS`, no bad opcode
+across the whole instruction bound. See "Native (host) tests" below.
+
+Separately, `sharpdisp/` (the Sharp memory-LCD framebuffer/font
+library) is now vendored by copy from `pico_sharpmem_display-main` (see
+`sharpdisp/README.md` for exactly what was and wasn't vendored, and the
+two local patches already baked into the copy), and `lcd_bringup/` is a
+real, standalone Pico SDK project — no dependency on `saturn_core/` or
+a ROM — that links against it and builds/links cleanly under the
+Pico 2 (RP2350) SDK 2.x + ARM GNU toolchain, producing a real
+`lcd_bringup.uf2`. This proves the build/link/toolchain path end to
+end; it has **not** been flashed to or visually confirmed on physical
+hardware by this project specifically (the vendored library + this
+exact display/breakout/Pico 2 combination was confirmed working prior
+to vendoring, by the prior work `sharpdisp/` was copied from — see
+`sharpdisp/README.md`). Flashing and visually confirming
+`lcd_bringup.uf2` on this project's own hardware is the immediate next
+step.
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -94,7 +109,11 @@ Scaffolded per the project's bootstrap plan, mirroring soynut's layout:
 - **`sharpdisp/`** — vendored *by copy* (not submodule — no upstream git
   history exists to submodule against) from
   `pico_sharpmem_display-main`, an already-working, LGPL-2.1 framebuffer
-  driver for the Sharp LS027B7DH01 on a Pico 2. Not yet copied in.
+  driver for the Sharp LS027B7DH01 on a Pico 2. Copied in: see
+  `sharpdisp/README.md` for exactly what was vendored (library only —
+  `include/`, `src/`, pre-generated `fonts/`, `LICENSE` — not upstream's
+  own examples/tests/tools) and the two local patches already baked in
+  (the `pico/platform.h` → `pico.h` swap SDK 2.x requires).
 - **`firmware/`** — will become the Pico SDK project: the real replica
   binary, wiring the Saturn core and `sharpdisp/` together. Not yet a
   Pico SDK project (no `CMakeLists.txt`/pico-sdk wiring exists), but
@@ -107,9 +126,16 @@ Scaffolded per the project's bootstrap plan, mirroring soynut's layout:
   SDK calls) so the same shims should carry over largely unchanged once
   firmware bring-up starts; not yet exercised on-target, so treat that
   as an assumption, not a confirmed fact.
-- **`lcd_bringup/`** — will become a standalone Pico SDK project (no
-  dependency on the Saturn core or a ROM) for isolated Sharp-display
-  bring-up, mirroring soynut's `lcd_bringup/`.
+- **`lcd_bringup/`** — a standalone Pico SDK project (no dependency on
+  the Saturn core or a ROM) for isolated Sharp-display bring-up,
+  mirroring soynut's `lcd_bringup/` structurally (`CMakeLists.txt`,
+  `main.c`, `pico_sdk_import.cmake`, `pins.h`) though its actual
+  "driver" is the vendored `sharpdisp/` library, not a project-local
+  controller driver like soynut's `st7920.c` (the Sharp display's own
+  vendored library already covers that). Builds and links cleanly
+  against `~/pico/pico-sdk` (master, SDK 2.x) and the ARM GNU toolchain,
+  producing a real `lcd_bringup.uf2` — see "Current status" above for
+  what's confirmed vs. still needing physical hardware.
 - **`roms/`** — BYO Saturn ROM `README.md` with the confirmed format
   (see "ROM images" below) and native-smoke-test run instructions. No
   converter script exists yet (that's firmware-bring-up work, for
@@ -129,10 +155,18 @@ Scaffolded per the project's bootstrap plan, mirroring soynut's layout:
   decision on what belongs here and whether any of it needs to be
   redistributable.
 - **`pico-sdk/`** — official `raspberrypi/pico-sdk` checkout (dependency,
-  not yet fetched), gitignored, same convention as soynut.
+  gitignored, same convention as soynut). Not present as a project-local
+  checkout on the machine this was developed on — `lcd_bringup/`'s
+  `CMakeLists.txt` (mirroring soynut's own fallback) uses the
+  `PICO_SDK_PATH` environment variable if set, and only falls back to a
+  project-local `../pico-sdk` if it isn't, so a machine-wide checkout
+  (e.g. `~/pico/pico-sdk`) works equally well and is what was actually
+  used to confirm `lcd_bringup/` builds — see "Current status" above.
 - **`toolchain/`** — extracted ARM GNU Toolchain (gitignored), same
-  no-sudo `pkgutil --expand-full` workaround soynut's `CLAUDE.md`
-  documents, once needed.
+  no-sudo `pkgutil --expand-full`-or-tarball workaround soynut's
+  `CLAUDE.md` documents. Same story as `pico-sdk/` above: not
+  project-local here, a machine-wide `~/pico/arm-gnu-toolchain` was used
+  instead, just needs to be on `PATH` at build time.
 
 Not yet present, and deliberately not scaffolded until confirmed
 necessary: an `Arduino .../`-equivalent dormant-hardware directory (no
@@ -389,6 +423,47 @@ without ever hitting `CPU_E_BAD_OPCODE`/`CPU_E_BAD_OPCODE2` — a real
 `PASS`, and the first concrete evidence the vendored core is decoding
 genuine Saturn machine code end to end through the shim layer, not just
 exercising its error paths.
+
+## Sharp display bring-up (`lcd_bringup/`)
+
+Standalone Pico SDK project, deliberately decoupled from `saturn_core/`
+and any ROM — proves the physical LS027B7DH01 + Adafruit breakout
+(#4694) + Pico 2 + toolchain chain works before wiring the Saturn core
+into `firmware/` at all. Mirrors soynut's `lcd_bringup/` structurally
+(`CMakeLists.txt`/`main.c`/`pico_sdk_import.cmake`/`pins.h`), but its
+actual driver is the vendored `sharpdisp/` library (see its own
+`README.md`) rather than a project-local controller driver — the Sharp
+display's own library already covers that layer.
+
+Build:
+
+```
+export PICO_SDK_PATH=~/pico/pico-sdk      # or wherever your checkout is
+export PICO_BOARD=pico2
+export PATH=~/pico/arm-gnu-toolchain/bin:$PATH
+cd lcd_bringup && mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j
+```
+
+Produces `lcd_bringup.uf2`. Flash with BOOTSEL held (drag-and-drop to
+the `RP2350` mass-storage volume) or `picotool load -x lcd_bringup.uf2`.
+
+`main.c` draws "Cassini" centered plus a border, once, then idles —
+deliberately the same shape as the vendored library's own `hello_world`
+example, which was already built/flashed/visually confirmed working on
+this exact display/breakout/Pico 2 combination before `sharpdisp/` was
+vendored (see `sharpdisp/README.md`). `pins.h` names the CS/SCK/MOSI
+pins explicitly (GP17/18/19, `spi0`) rather than relying on
+`sharpdisp_init_default()`'s internal default, even though they
+currently match — see "Hardware" below.
+
+**Verified:** builds and links cleanly (strict warnings on `main.c`,
+vendored `sharpdisp/` sources left at their own warning level, same
+split `tests/Makefile` uses) against `~/pico/pico-sdk` (master, SDK 2.x)
+and the ARM GNU toolchain, producing a real `.uf2`. **Not yet verified:**
+flashing it onto this project's own physical hardware and visually
+confirming output — that's the immediate next step.
 
 ## ROM images — bring your own
 
