@@ -24,3 +24,27 @@ This file starts empty — no code exists yet to deviate. Entries get added
 as real exceptions are actually found during implementation, not
 speculated in advance. Treat it as authoritative over any inline comment
 if the two ever disagree, once entries exist.
+
+## `firmware/saturn_compat/chf_compat.c` — `-Wvarargs` on `ChfGenerate()`
+
+**Rule affected:** the project's `-Wall -Wextra -Wpedantic -Werror`
+strict-compile posture (not a numbered Power-of-10 rule itself, but the
+same "no silent laxity" spirit Rule 10 asks for).
+
+**What's excepted:** a single `va_start(args, severity)` call inside
+`ChfGenerate()`, wrapped in a `#pragma clang/GCC diagnostic ignored
+"-Wvarargs"` push/pop.
+
+**Why:** `ChfGenerate()`'s signature is fixed by the vendored
+`saturn_core/src/libChf/src/Chf.h` — this shim must match it exactly
+to stand in for real libChf. Its last named parameter before `...` is
+`const ChfSeverity severity`, an enum; enums undergo default argument
+promotion, which `-Wpedantic` flags as `va_start`-adjacent undefined
+behavior per the letter of the C standard. Every real compiler handles
+this correctly in practice (it's the same shape as any syslog-style
+variadic logger) — the diagnostic is pedantry about an API shape this
+project doesn't get to choose, not a real correctness risk.
+
+**Boundary:** exactly that one `va_start` call. Nothing else in
+`chf_compat.c` or elsewhere suppresses `-Wvarargs`, `-Wpedantic`, or
+any other warning class.
