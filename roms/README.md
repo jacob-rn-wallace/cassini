@@ -39,10 +39,21 @@ This boots the ROM against the vendored `saturn_core` (via
 instructions, reporting PASS/FAIL based on whether the CPU core ever
 hits an unrecognized opcode.
 
-A converter that embeds a ROM as C source (for the actual Pico
-firmware build, which can't do host-style `fopen()`) doesn't exist yet
-— that's later firmware-bring-up work, not needed for this host smoke
-test.
+## Embedding a ROM for the real firmware build
+
+The actual Pico firmware (`firmware/`) can't do host-style `fopen()`,
+so `rom_to_c.py` embeds a raw ROM file as a C byte array instead:
+
+```
+python3 rom_to_c.py hp48sx_revj.rom rom_images.c
+```
+
+Gitignored output (`roms/rom_images.c`), same BYO-ROM policy as
+everywhere else — never committed. See `CLAUDE.md`'s "Native firmware"
+section for how `firmware/rom_syscalls.c` serves this array back to
+`saturn_core`'s unmodified ROM-loading code, and for the current status
+of the firmware build itself (builds and flashes, currently blocked at
+runtime on a real memory constraint, not a code bug).
 
 ## Verifying a dump
 

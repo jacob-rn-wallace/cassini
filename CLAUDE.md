@@ -86,11 +86,33 @@ own physical Pico 2 (via `picotool load -f -x`, which force-rebooted
 the board into BOOTSEL mode over its existing USB connection rather
 than needing the physical BOOTSEL button held) and **visually
 confirmed working**: "Cassini" centered plus a border, rendered
-correctly on the real LS027B7DH01. Phase 3 is fully closed — the next
-phase is wiring `saturn_core` + `firmware/saturn_compat/` +
-`sharpdisp/` together into a real `firmware/` Pico SDK project (the
-per-model display-scaling decision from "Hardware" below is still open
-at that point).
+correctly on the real LS027B7DH01. Phase 3 is fully closed.
+
+**Phase 4 (wiring `saturn_core` + `firmware/saturn_compat/` +
+`sharpdisp/` into a real `firmware/` Pico SDK project) is in progress
+and currently blocked on a real hardware memory constraint, not a
+code bug.** The display-scaling decision from "Hardware" below is
+resolved (3x nearest-neighbor, 393x192 centered in the 400x240 panel,
+top 24px margin reserved for annunciator text labels — the user's
+explicit direction). A real `firmware/` project exists, builds cleanly,
+flashes successfully, and its `EmulatorInit()` cold-boot cascade
+matches the host smoke test's own proven WARNING-then-cold-reset
+behavior exactly — but it then panics with `Out of mem` while loading
+the ROM. Root cause, confirmed precisely: the vendored core stores each
+emulated nibble as a full byte (`typedef char Nibble`, deliberate but
+memory-inefficient — fine for the desktop-scale RAM this core was
+originally written against), so the unpacked 256 KiB HP48SX ROM alone
+needs 512 KiB of RAM — **exactly 100% of the Pico 2's entire 512 KiB
+SRAM** (confirmed directly from the linked binary's own memory map,
+not estimated), before counting the emulator's internal RAM/Port 1
+buffers, this project's own static data, the stack, or heap overhead.
+See "Native firmware (`firmware/`)" below for the full technical
+account — the newlib syscall shim used to embed the ROM, the build
+fixes required, the debugging process, and the precise blocker with
+the real options for resolving it (none yet chosen — paused for a
+decision, since every real fix requires either editing vendored core
+logic more deeply than this project has ever done, or different
+hardware).
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -118,18 +140,18 @@ Scaffolded per the project's bootstrap plan, mirroring soynut's layout:
   `include/`, `src/`, pre-generated `fonts/`, `LICENSE` — not upstream's
   own examples/tests/tools) and the two local patches already baked in
   (the `pico/platform.h` → `pico.h` swap SDK 2.x requires).
-- **`firmware/`** — will become the Pico SDK project: the real replica
-  binary, wiring the Saturn core and `sharpdisp/` together. Not yet a
-  Pico SDK project (no `CMakeLists.txt`/pico-sdk wiring exists), but
-  `firmware/saturn_compat/` already holds real build-compatibility
-  shims for the vendored core (`chf_compat.c`, `ui4x_compat.c`,
-  `config_compat.c`, `saturn_compat.h`, `ui4x/src/api.h`), mirroring
-  soynut's `emu41gcc_compat/` — see "Native (host) tests" below and
-  "Current status" above for what they cover and how they were
-  verified. Written host-portable on purpose (POSIX libc only, no Pico
-  SDK calls) so the same shims should carry over largely unchanged once
-  firmware bring-up starts; not yet exercised on-target, so treat that
-  as an assumption, not a confirmed fact.
+- **`firmware/`** — the real Pico SDK project wiring the Saturn core,
+  `firmware/saturn_compat/`, and `sharpdisp/` together
+  (`CMakeLists.txt`, `pico_sdk_import.cmake`, `main.c`, `pins.h`,
+  `saturn_lcd.c`/`.h`, `rom_syscalls.c`/`.h`, `stubs/sys/ucontext.h`).
+  Builds and flashes successfully; currently blocked at runtime on a
+  real memory constraint, not a code bug — see "Current status" above
+  and "Native firmware (`firmware/`)" below for the full account.
+  `firmware/saturn_compat/` (`chf_compat.c`, `ui4x_compat.c`,
+  `config_compat.c`, `saturn_compat.h`, `ui4x/src/api.h`) is confirmed
+  to carry over completely unchanged from the host build, exactly as
+  planned — mirroring soynut's `emu41gcc_compat/`, see "Native (host)
+  tests" below for what they cover.
 - **`lcd_bringup/`** — a standalone Pico SDK project (no dependency on
   the Saturn core or a ROM) for isolated Sharp-display bring-up,
   mirroring soynut's `lcd_bringup/` structurally (`CMakeLists.txt`,
@@ -481,6 +503,177 @@ a real `.uf2`. That `.uf2` has been flashed to this project's own
 Pico 2 + LS027B7DH01 + Adafruit breakout (#4694) and visually
 confirmed: "Cassini" centered plus a border render correctly on the
 real display. Phase 3 has no open items.
+
+## Native firmware (`firmware/`)
+
+Phase 4: wires `saturn_core` + `firmware/saturn_compat/` +
+`sharpdisp/` into one real Pico SDK executable (`cassini`) that boots a
+compiled-in HP48SX ROM and renders its emulated LCD to the physical
+Sharp display. Scope, confirmed with the user: a *static bring-up*
+milestone — run the CPU for a bounded instruction count (same safety
+pattern as `tests/saturn_smoke_test.c`), render once, idle. No
+keyboard, no real-time timer-driven loop — there's no physical keyboard
+hardware for this project yet, so real-time interactivity is its own
+later phase.
+
+**Display layout**, per the user's explicit direction: the native
+HP48SX 131x64 LCD scaled 3x (393x192), centered in the 400x240 panel —
+3px left / 4px right margin (400-393=7, uneven by construction), 24px
+top / 24px bottom (240-192=48, split evenly). The top 24px band holds a
+row of small text annunciator labels (L/R/A/BAT/BSY/IO, matching
+`emulator_api.c`'s `ANN_LEFT`/`ANN_RIGHT`/`ANN_ALPHA`/`ANN_BATTERY`/
+`ANN_BUSY`/`ANN_IO` bits) rather than being left blank — the user's
+explicit reason for preferring 3x over a larger scale that would fill
+the panel.
+
+### ROM embedding
+
+`roms/rom_to_c.py` (new, mirrors soynut's own converter) embeds a raw
+ROM file as `const unsigned char cassini_rom_data[]` — no nibble
+unpacking or other transform, unlike soynut's converter, since
+`saturn_core`'s own `disk_io.c` (`bus_read_nibblesFromFile()`, called
+unmodified from `romram48.c`'s `RomInit48()`) already does that
+unpacking itself via `fopen()`/`getc()`/`fclose()`. Run manually/
+offline (`python3 roms/rom_to_c.py roms/hp48sx_revj.rom
+roms/rom_images.c`); output gitignored, never committed (BYO ROM
+policy, same as everywhere else in this project).
+
+Rather than touch `disk_io.c`'s call chain, `firmware/rom_syscalls.c`
+overrides the newlib syscalls `fopen`/`getc`/`fclose` are themselves
+built on — `_open()`/`_read()`/`_close()`, all declared
+`__attribute__((weak))` in `~/pico/pico-sdk/src/rp2_common/
+pico_clib_interface/newlib_interface.c` (confirmed directly; a strong
+definition cleanly overrides a weak one at link time, standard newlib
+retargeting, no duplicate-symbol risk). It recognizes one magic
+filename (`EMBEDDED_ROM_PATH`, shared with `main.c` via
+`rom_syscalls.h`, passed to the existing `saturn_compat_set_rom_path()`
+API) and serves bytes from the compiled-in array; every other path
+fails cleanly, exactly preserving the WARNING-then-cold-reset fallback
+`firmware/saturn_compat/ui4x_compat.c`'s `Resolve()` already creates
+for RAM/Port1/Port2. Also provides `_stat()` — discovered as a real
+link error, not speculative: newlib bundles `_stat_r` together with
+`_fstat_r` in the same object file, so referencing the SDK's
+already-weakly-stubbed `_fstat()` still pulls in `_stat_r`'s own body,
+which calls the never-stubbed `_stat()`. `_fstat()`/`_lseek()` stay as
+the SDK's existing weak stubs — confirmed harmless (`fopen`'s
+`fstat`-based buffer sizing just falls back to a default size on
+failure; `bus_read_nibblesFromFile()` never calls `lseek()`).
+
+### LCD decode (`firmware/saturn_lcd.c`/`.h`)
+
+Reimplemented directly against the vendored core's global `hdw`
+(`extern hdw_t hdw;`, `hdw.h:84`) and `bus_fetch_nibble()`, deliberately
+**not** reusing `saturn_core/src/emulator_api.c` (it depends on the
+un-vendored `ui4x` submodule) — but copied verbatim as the reference
+for the exact decode algorithm rather than re-derived: rows
+`0..hdw.lcd_vlc` come from `hdw.lcd_base_addr` advancing
+`hdw.lcd_line_offset` nibbles between rows; remaining rows to full
+height (64, hardcoded — confirmed HP48SX/GX standard, not present
+anywhere in vendored source) come from `hdw.lcd_menu_addr`. Bit 0
+(LSB) of each nibble = leftmost of its 4 pixels, bit 3 (MSB) =
+rightmost. Blits via `bitmap_filled_rect()`
+(`sharpdisp/include/sharpdisp/bitmapshapes.h`) — a real filled rect,
+distinct from the outline-only `bitmap_rect()` `lcd_bringup/main.c`
+uses.
+
+### Two build accommodations found on this toolchain (neither needed by
+the host build)
+
+- `saturn_core/src/core/bus.c:105` unconditionally `#include
+  <sys/ucontext.h>` — confirmed completely unused in the file (no
+  `ucontext_t`/`mcontext_t`/`sigaction` reference anywhere), present on
+  macOS's libc (why the host build never hit this) but absent from the
+  ARM/newlib toolchain. Fixed with an empty stub
+  (`firmware/stubs/sys/ucontext.h`) on the include path — same
+  "make unmodified vendored source build under a different compiler"
+  posture as the next item.
+- `serial.c` calls `read()`/`write()`/`close()` without including
+  `<unistd.h>` itself — same issue `tests/Makefile` already handles for
+  the host build, fixed identically via a `-include unistd.h`
+  force-include scoped to just that one file.
+
+### The `stdio_usb_connected()` gotcha
+
+`main.c` originally used a fixed `sleep_ms(1500)` before its first
+`printf()`, guessing that was "enough time" for a USB serial terminal
+to attach. `pico_stdio_usb`'s CDC output is **silently dropped** when
+written before a real terminal has connected — no fixed delay can
+guarantee that in general, and it cost real debugging time (several
+flash-wait-check cycles showing "nothing" over serial that were fully
+explained by this, not a firmware bug). Fixed by blocking on
+`stdio_usb_connected()` (`pico/stdio_usb.h`) in a loop before printing
+anything, so no boot output is ever lost regardless of how long the
+user takes to attach a terminal — a real, permanent fix, not a
+debugging-only hack, kept in place.
+
+### Current blocker: ROM memory footprint exceeds the Pico 2's RAM
+
+The build is fully clean (strict warnings on this project's own files,
+same split as everywhere else) and flashes successfully. At runtime it
+correctly reproduces the exact same cold-boot WARNING cascade the host
+smoke test already proved (`ERROR: Can't open file
+[/nonexistent-cassini-state-path]` / `WARNING: Can't restore CPU status
+from disk; resetting CPU`) — real evidence the newlib syscall shim and
+compat layer are wired correctly. It then panics: `*** PANIC *** / Out
+of mem`.
+
+Root cause, confirmed precisely (not estimated): `romram48.c:117` does
+one `malloc(sizeof(struct BusStatus_48))` call. That struct's fields
+(`bus.h:183-196`) are ROM 1 MiB (`N_ROM_SIZE_48` — sized for the
+*larger* HP48GX ROM regardless of which model is selected at runtime,
+since model choice is a runtime `ui4x_config.model` value, not a
+compile-time branch), RAM 256 KiB, Port 1 256 KiB, and **Port 2 8 MiB**
+(`N_PORT_2_BANK_48` hardcoded to `32` — `bus.h`'s own comment says the
+intended default was `8` (1 MiB), with a commented-out
+model-conditional line directly above showing the original design,
+`config.model == MODEL_48GX ? 32 : 1`, disabled at some point upstream
+in favor of the unconditional value. HP48SX doesn't have this card slot
+in real hardware at all.) Total: **~9.5 MiB requested in one call**,
+against the Pico 2's actual total SRAM, confirmed directly from the
+linked binary's own memory map (`RAM 0x20000000, length 0x00080000` =
+exactly 512 KiB, not estimated from a datasheet).
+
+Eliminating Port 2 entirely and right-sizing the other three constants
+to real HP48SX-accurate values is **necessary but not sufficient**: the
+vendored core stores every emulated nibble as a full byte
+(`typedef char int4; typedef int4 Nibble;`, `types.h`) — deliberate,
+but memory-inefficient, evidently fine for the desktop-scale RAM this
+core was originally written against. The 256 KiB HP48SX ROM file,
+unpacked at 1 byte per nibble, needs **512 KiB just for the ROM array
+alone — exactly 100% of the Pico 2's entire 512 KiB SRAM**, before
+counting the emulator's own RAM/Port 1 buffers, this project's own
+static data (~18 KiB, confirmed via `arm-none-eabi-size`), the stack,
+or heap overhead.
+
+**Real options, none yet chosen — paused for a decision:**
+1. Pack 2 nibbles per byte instead of 1 (halves ROM storage to a
+   fitting 256 KiB) — touches how the core addresses memory throughout
+   `bus_fetch_nibble()`/`bus_write_nibble()` and likely other call
+   sites, not just size constants; a materially bigger, riskier edit to
+   vendored logic than a constants-only patch.
+2. Reference the ROM directly from flash (XIP) instead of copying it
+   into RAM at all — the "right" embedded-systems answer (Pico has
+   4 MiB of flash; ROM is read-only data), but requires changing `rom`
+   from a fixed in-struct array to a pointer and adjusting how it's
+   addressed — also a deeper structural change than constants alone.
+3. Different/bigger hardware — a board with add-on PSRAM would sidestep
+   this without touching vendored code at all.
+4. Reconsider scope — accept that a full real-ROM boot isn't achievable
+   on this specific board with the core's current architecture as-is.
+
+Whichever path is chosen, it will be **this project's first edit to
+the vendored `saturn_core` submodule** (options 1-2) or a hardware
+change (option 3) or a scope change (option 4) — a real departure from
+the "vendored; never edited directly" posture stated since Phase 1, not
+something to decide unilaterally. If an edit is chosen, the
+recommended mechanism is a maintained patch file (e.g.
+`saturn_core.patch`, tracked in this repo, applied as a build step)
+rather than editing the submodule's checked-out files directly — that
+keeps `saturn_core/`'s own git identity pristine (a fresh
+`git submodule update --init` still gets the exact pinned upstream
+commit) while the modification stays fully visible/auditable as a diff
+in this repo, the same pattern Debian packages and Homebrew formulas
+use for "vendor a dependency, need one small patch."
 
 ## ROM images — bring your own
 
