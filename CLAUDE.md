@@ -51,10 +51,12 @@ not a conflict with, this project's own GPL-3.0 terms.
 
 ## Current status
 
-**Phase 1 (vendor the core) and Phase 2 (native host smoke test,
-including a real ROM run) are done. Phase 3 (Sharp display bring-up) is
-also done at the build level; no physical hardware bring-up has
-happened yet.** `saturnng` was selected after cloning and reading both
+**Phases 1 through 3 are all done, including real hardware
+confirmation.** Phase 1 (vendor the core) and Phase 2 (native host
+smoke test, including a real ROM run) are done. Phase 3 (Sharp display
+bring-up) is now fully verified end to end, including on physical
+hardware — see below. `saturnng` was selected after cloning and reading
+both
 candidates directly, and is vendored at `saturn_core/` as a pinned git
 submodule (see "The Saturn CPU core" below). On top of that,
 `firmware/saturn_compat/` has real shim code — a from-scratch,
@@ -79,14 +81,16 @@ two local patches already baked into the copy), and `lcd_bringup/` is a
 real, standalone Pico SDK project — no dependency on `saturn_core/` or
 a ROM — that links against it and builds/links cleanly under the
 Pico 2 (RP2350) SDK 2.x + ARM GNU toolchain, producing a real
-`lcd_bringup.uf2`. This proves the build/link/toolchain path end to
-end; it has **not** been flashed to or visually confirmed on physical
-hardware by this project specifically (the vendored library + this
-exact display/breakout/Pico 2 combination was confirmed working prior
-to vendoring, by the prior work `sharpdisp/` was copied from — see
-`sharpdisp/README.md`). Flashing and visually confirming
-`lcd_bringup.uf2` on this project's own hardware is the immediate next
-step.
+`lcd_bringup.uf2`. That `.uf2` has now been flashed to this project's
+own physical Pico 2 (via `picotool load -f -x`, which force-rebooted
+the board into BOOTSEL mode over its existing USB connection rather
+than needing the physical BOOTSEL button held) and **visually
+confirmed working**: "Cassini" centered plus a border, rendered
+correctly on the real LS027B7DH01. Phase 3 is fully closed — the next
+phase is wiring `saturn_core` + `firmware/saturn_compat/` +
+`sharpdisp/` together into a real `firmware/` Pico SDK project (the
+per-model display-scaling decision from "Hardware" below is still open
+at that point).
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -447,7 +451,12 @@ make -j
 ```
 
 Produces `lcd_bringup.uf2`. Flash with BOOTSEL held (drag-and-drop to
-the `RP2350` mass-storage volume) or `picotool load -x lcd_bringup.uf2`.
+the `RP2350` mass-storage volume), or `picotool load -f -x
+lcd_bringup.uf2` — the `-f` forces the board into BOOTSEL mode over its
+existing USB connection first if it isn't already there (confirmed
+working even when the board was running unrelated previously-flashed
+firmware enumerating as USB-serial, no physical button press needed),
+and `-x` reboots straight into the newly-flashed app afterward.
 
 `main.c` draws "Cassini" centered plus a border, once, then idles —
 deliberately the same shape as the vendored library's own `hello_world`
@@ -456,14 +465,22 @@ this exact display/breakout/Pico 2 combination before `sharpdisp/` was
 vendored (see `sharpdisp/README.md`). `pins.h` names the CS/SCK/MOSI
 pins explicitly (GP17/18/19, `spi0`) rather than relying on
 `sharpdisp_init_default()`'s internal default, even though they
-currently match — see "Hardware" below.
+currently match — see "Hardware" below. Note `main.c` never calls
+`stdio_init_all()`, so despite `CMakeLists.txt` enabling
+`pico_enable_stdio_usb`, no USB serial console actually comes up at
+runtime (harmless — the display path is pure SPI, independent of USB
+stdio — but it does mean `picotool info` can't be used to confirm the
+board is running this program after flashing; only the physical display
+output can).
 
-**Verified:** builds and links cleanly (strict warnings on `main.c`,
-vendored `sharpdisp/` sources left at their own warning level, same
-split `tests/Makefile` uses) against `~/pico/pico-sdk` (master, SDK 2.x)
-and the ARM GNU toolchain, producing a real `.uf2`. **Not yet verified:**
-flashing it onto this project's own physical hardware and visually
-confirming output — that's the immediate next step.
+**Fully verified, including on physical hardware:** builds and links
+cleanly (strict warnings on `main.c`, vendored `sharpdisp/` sources left
+at their own warning level, same split `tests/Makefile` uses) against
+`~/pico/pico-sdk` (master, SDK 2.x) and the ARM GNU toolchain, producing
+a real `.uf2`. That `.uf2` has been flashed to this project's own
+Pico 2 + LS027B7DH01 + Adafruit breakout (#4694) and visually
+confirmed: "Cassini" centered plus a border render correctly on the
+real display. Phase 3 has no open items.
 
 ## ROM images — bring your own
 
