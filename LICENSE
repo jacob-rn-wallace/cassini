@@ -1,0 +1,15 @@
+LICENSE — not yet finalized.
+
+This project's final license depends on the license of whichever Saturn
+CPU emulation core ends up vendored (see CLAUDE.md's "The Saturn CPU
+core" section), plus the confirmed LGPL-2.1 terms of the vendored-by-copy
+`sharpdisp/` display library. Soynut (this project's structural template)
+adopted GPL-2.0-or-later specifically to match its own vendored core's
+exact terms, since its firmware statically links that core's code into
+one binary — Mercator will need the same kind of deliberate choice once
+its own core's real license is confirmed by reading its actual source,
+not before.
+
+This placeholder grants no rights and should not be treated as a real
+license. Do not redistribute this repository's contents relying on this
+file.

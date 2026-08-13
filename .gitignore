@@ -1,0 +1,25 @@
+toolchain
+build/
+.claude/settings.local.json
+reference-material/
+DEVLOG.md
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Official raspberrypi/pico-sdk checkout, meant to live outside any one
+# project's repo (PICO_SDK_PATH is exactly for this). See CLAUDE.md for
+# how to fetch the matching version, once pinned.
+pico-sdk
+
+# Copyrighted Saturn-family ROM firmware dumps and the generated C source
+# that re-encodes them - not ours to redistribute. Each user must supply
+# their own legally-obtained ROM files here; see roms/README.md.
+roms/*.ROM
+roms/*.rom
+roms/rom_images.c
+
+# sim/'s host-file-backed continuous-memory snapshot - local runtime
+# state, not source, same treatment as roms/rom_images.c above.
+sim/mercator_sim_persist.bin

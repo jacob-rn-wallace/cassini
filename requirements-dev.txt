@@ -1,0 +1,7 @@
+# Power of 10, Rule 10: static analysis tooling for this project's Python
+# files (tools/, roms/, and any generator scripts added later).
+# Install with: pip3 install -r requirements-dev.txt
+# Run with:     ruff check . && mypy .
+ruff
+mypy
+types-pyserial
