@@ -46,5 +46,20 @@ test.
 
 ## Verifying a dump
 
-Not yet written — pending a first real ROM dump to test the size/format
-checks above against.
+Confirmed working against a real HP48SX revision J dump (262,144 bytes,
+matching the format above): drop it anywhere and point `ROM=` at it —
+`ROM=` accepts an absolute path, a path relative to `tests/`, or (the
+common case) a path relative to the repo root, e.g. if the file lives
+at `roms/hp48sx_revj.rom`:
+
+```
+make -C tests run ROM=roms/hp48sx_revj.rom MODEL=48sx
+```
+
+A correct dump cold-boots (WARNING-level "can't restore state, resetting"
+messages for HDW/internal RAM/Port 1/Port 2 are expected and harmless —
+there's no saved state file, by design, see `CLAUDE.md`'s "Native (host)
+tests" section) and then reports `PASS: no bad opcode in <N>
+instructions` after running the full instruction bound. A `FATAL: Can't
+initialize internal ROM` instead means the file wasn't found at the
+resolved path, or doesn't match the expected size for the model given.

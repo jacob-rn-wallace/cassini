@@ -79,8 +79,19 @@ run: all
 	@if [ -z "$(ROM)" ]; then \
 		echo "usage: make -C tests run ROM=/path/to/your.rom [MODEL=48sx|48gx]"; \
 		exit 2; \
-	fi
-	./$(BUILD)/saturn_smoke_test $(MODEL) $(ROM)
+	fi; \
+	if [ -f "$(ROM)" ]; then \
+		rom_resolved="$(ROM)"; \
+	elif [ -f "../$(ROM)" ]; then \
+		rom_resolved="../$(ROM)"; \
+	else \
+		echo "ROM not found: $(ROM) (also tried ../$(ROM))"; \
+		echo "note: 'make -C tests' runs from inside tests/, so a"; \
+		echo "relative ROM= path is looked up from there first, then"; \
+		echo "from one directory up (the common case: roms/ at the repo root)."; \
+		exit 2; \
+	fi; \
+	./$(BUILD)/saturn_smoke_test $(MODEL) "$$rom_resolved"
 
 clean:
 	rm -rf $(BUILD)

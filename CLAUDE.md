@@ -332,6 +332,12 @@ hardware. Currently one test, `tests/saturn_smoke_test.c`:
 make -C tests run ROM=/path/to/your.rom MODEL=48sx   # or MODEL=48gx
 ```
 
+`ROM=` accepts an absolute path, a path relative to `tests/` (since
+`make -C tests` changes directory before running), or — the common
+case, since `roms/` lives at the repo root — a path relative to the
+repo root (e.g. `ROM=roms/hp48sx_revj.rom`); the `run` target's recipe
+tries all three in that order before giving up.
+
 It boots a real HP48SX/HP48GX ROM (BYO, see "ROM images" below)
 against the vendored `saturn_core`, wired through
 `firmware/saturn_compat/`'s shims, via `saturn_core/src/core/emulator.c`'s
@@ -365,19 +371,24 @@ whose last named parameter is an enum, forced by `Chf.h`'s own
 `ChfGenerate()` signature) — see `DEVIATIONS.md` for the full
 justification and exact boundary.
 
-**Verified so far, without a real ROM:** the harness builds and links
-cleanly, and running it against a nonexistent ROM path exercises both
+**Verified, including against a real ROM.** The harness builds and
+links cleanly. Running it against a nonexistent ROM path exercises both
 Chf severity paths correctly — a missing optional state file
 (`cpu`/`mod`/...) signals `WARNING` and falls through to a clean cold
 `CpuReset()`/`bus_reset()` exactly as `EmulatorInit()` intends, while a
 missing ROM file signals `FATAL` and the shim's default
 no-handler-registered policy cleanly `exit(1)`s — real evidence the
 `ChfGenerate`/`ChfSignal`/handler-stack wiring behaves correctly in
-both the "recoverable" and "unrecoverable" cases. **Not yet verified:**
-an actual pass/fail run against a real HP48SX/HP48GX ROM dump, since
-none exists on the machine this was developed on and ROMs are BYO by
-policy. That's the immediate next step whenever a real ROM is
-available.
+both the "recoverable" and "unrecoverable" cases. Beyond that, a real
+BYO HP48SX ROM dump (revision J, 262,144 bytes, matching the confirmed
+size below) has now been run end to end: cold-init falls through
+`WARNING`s for HDW/internal RAM/Port 1/Port 2 exactly as the
+no-saved-state path predicts, then the CPU runs the full
+`MAX_INSTR` = 2,000,000-instruction bound landing at PC `0x0127D`
+without ever hitting `CPU_E_BAD_OPCODE`/`CPU_E_BAD_OPCODE2` — a real
+`PASS`, and the first concrete evidence the vendored core is decoding
+genuine Saturn machine code end to end through the shim layer, not just
+exercising its error paths.
 
 ## ROM images — bring your own
 
