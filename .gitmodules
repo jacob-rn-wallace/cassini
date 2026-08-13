@@ -1,0 +1,3 @@
+[submodule "saturn_core"]
+	path = saturn_core
+	url = https://codeberg.org/gwh/saturnng.git
