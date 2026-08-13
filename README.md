@@ -22,6 +22,21 @@ as a "never edit" black box, BYO ROM, pure-logic/hardware-split bridge
 files, the same coding-standard commitment) but nothing else; the
 Saturn-family-specific logic underneath is entirely new.
 
+## Getting the code
+
+`saturn_core/` is a git submodule — a plain `git clone` will leave it as
+an empty directory. Either clone with submodules from the start:
+
+```
+git clone --recurse-submodules https://github.com/jacob-rn-wallace/cassini.git
+```
+
+or, if you already cloned without that flag:
+
+```
+git submodule update --init
+```
+
 ## Status
 
 **Repo scaffolded, Saturn CPU core selected and vendored.** No firmware
