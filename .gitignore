@@ -22,4 +22,4 @@ roms/rom_images.c
 
 # sim/'s host-file-backed continuous-memory snapshot - local runtime
 # state, not source, same treatment as roms/rom_images.c above.
-sim/mercator_sim_persist.bin
+sim/cassini_sim_persist.bin

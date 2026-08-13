@@ -1,19 +1,34 @@
-# HP 50g Replica Project — Mercator
+# Saturn-Family HP Calculator Replica Project — Cassini
 
 Real Saturn-CPU-family calculator emulation running on a Raspberry Pi
 Pico 2, driving a real Sharp LS027B7DH01 memory LCD (400x240, on an
-Adafruit breakout board, #4694) wired to show the real HP50G's native
-131x80 graphics (confirmed — see "The Saturn CPU core" below) scaled 3x
-(393x240) to exactly fill the display's pixel height, with keypresses
-coming from a computer over USB serial for now (a physical keyboard is a
-possible future step).
+Adafruit breakout board, #4694). Named for the Cassini space probe,
+which orbited Saturn — a nod to the Saturn CPU architecture shared by
+HP's late-80s-through-2000s calculator lineage (48SX/48GX/40G/49G/50G,
+whichever of these the vendored core actually supports — see "The
+Saturn CPU core" below).
+
+**Scope, deliberately broader than a single model.** This project
+originally started as an HP 50g-only replica; it's now explicitly about
+the whole Saturn-CPU calculator family, because the vendored emulation
+core (`saturnng`) already treats them as close relatives sharing most of
+their architecture, and because that gives a real sequencing advantage:
+**start with whichever supported model is architecturally simplest, get
+that working end-to-end on real hardware first, and only then take on
+the more complex models** — the HP50G most of all, since it's the
+newest, has the largest/tallest native display (131x80 vs. the 131x64
+shared by the older models), and uses a Flash-based memory subsystem
+rather than the simpler ROM-based one the 48-series uses. Which model is
+genuinely simplest to bring up first is a Phase 2 investigation item,
+not a settled decision yet — see "Hardware" below for the current
+best-guess reasoning (HP48SX) and what would need confirming.
 
 Structured as a sibling project to `soynut` (an HP-41CV replica) —
 soynut is this project's structural template: same target MCU, same
 "vendor an existing CPU emulation core, BYO ROM, never edit the vendored
 core" approach, same directory shape, same coding-standard commitment.
 Nothing in soynut is copied wholesale; its *conventions* are re-derived
-here since the Saturn/50g-specific logic underneath is entirely
+here since the Saturn-family-specific logic underneath is entirely
 different from the HP-41's Nut CPU.
 
 This is the stable reference doc: confirmed architecture, current
@@ -128,7 +143,7 @@ emulator.c, flash49.c, hdw.c, keyboard.c, monitor.c, romram48.c,
 romram49.c, serial.c, types.h) has zero includes of glib/GTK/SDL/ncurses/
 pthread/X11 — those only appear in `src/main.c`, `src/options.c`, and
 `src/ui4x/` (a separate git submodule for the UI layer, deliberately
-**not** initialized in this repo's vendoring — Mercator only needs
+**not** initialized in this repo's vendoring — Cassini only needs
 `src/core/`, never `src/ui4x/`). Two real, small dependencies the core
 does have, both handled as bridge-shim work rather than edits to the
 vendored code itself:
@@ -160,10 +175,12 @@ unverified assumption that HP49G matched the 50g's 131×80, which is
 wrong. **HP50G is 131×80**, confirmed by the same header, and
 `saturnng` already models `MODEL_50G` as a distinct configuration
 (`dist/style-50g.css` exists, though `dist/saturn50g` — a launcher script
-— doesn't yet, unlike 40g/48gx/48sx/49g). This means Mercator can target
-the **real HP50G display geometry directly**, without needing a
-different (49G-based) scale factor as a stand-in — see "Hardware" below.
-Whether `saturnng`'s Flash-based ROM/RAM subsystem (shared between
+— doesn't yet, unlike 40g/48gx/48sx/49g). This means that whenever the
+HP50G specifically gets tackled (see "Hardware" below on why it's
+currently the *last* model in the planned sequence, not the first),
+Cassini can target its **real display geometry directly**, without
+needing a different (49G-based) scale factor as a stand-in. Whether
+`saturnng`'s Flash-based ROM/RAM subsystem (shared between
 49G/50G, differentiated mainly by this LCD-height config and by which
 ROM file's actual content is loaded) is enough to run a real 50G-labeled
 Saturn-mode ROM dump correctly hasn't been tested yet — that's Phase 2's
@@ -220,7 +237,7 @@ intermixed with that buffer's own state, not cleanly separated. Kept
 here as a documented, evaluated alternative in case `saturnng` proves
 unworkable during Phase 2 — not because it's a strictly worse Saturn
 core in general, but because it doesn't cover the HP49G/50G-family
-architecture Mercator specifically needs.
+architecture Cassini specifically needs.
 
 ## Hardware
 
@@ -233,12 +250,29 @@ architecture Mercator specifically needs.
 - **MCU:** Raspberry Pi Pico 2 (RP2350), raw Pico C SDK — same choice as
   soynut, for the same reason (RAM/flash headroom over an Uno-class
   board).
-- **Scaling:** HP50G's native 131x80 (confirmed — see "The Saturn CPU
-  core" above) scaled by an exact integer factor of 3x, giving
-  393x240 — an exact fit against the Sharp display's 240-pixel height
-  (0px vertical margin), with 7px of horizontal slack (393 of 400) to
-  either center/letterbox or fill edge-to-edge, a decision for the
-  display-bridge implementation phase, not blocking anything now.
+- **Scaling — per-model, not fixed.** Native resolution differs across
+  the Saturn family: HP48SX/48GX/40G/49G are 131x64, HP50G is 131x80
+  (see "The Saturn CPU core" above). The Sharp display's 240px height
+  was originally chosen for the 50G specifically (3x → 393x240, an
+  exact fit, 0px vertical margin). For a 131x64 model at the same 3x
+  factor, that's 393x192 — a real 48px of unused vertical space (192 of
+  240), which needs a real decision once a first target model is
+  chosen: letterbox/center it, use a larger non-integer-friendly scale
+  (unlikely to stay pixel-exact), or accept the smaller model just not
+  filling the display. Not resolved yet — deliberately deferred to
+  whichever model Phase 2 actually targets first, rather than guessed
+  now.
+- **First target model — tentative, not yet confirmed.** Best current
+  guess is **HP48SX**: it uses `saturnng`'s simpler ROM-based memory
+  subsystem (`romram48.c`, 512 KiB ROM) rather than the Flash-based one
+  49G/50G share (`romram49.c`, 2 MiB), and (unlike 48GX) has no RAM-card
+  slot complexity to model. This reasoning hasn't been verified against
+  `romram48.c`'s actual contents yet, and HP40G's exact memory subsystem
+  (confirmed only as "supported" by `saturnng` in an earlier,
+  less-rigorous research pass, not independently verified the way
+  48SX/48GX/49G/50G's details were) is still an open question — could
+  turn out simpler or more complex than 48SX. Confirming this ranking is
+  Phase 2 work, alongside the native smoke test itself.
 
 ## ROM images — bring your own
 
