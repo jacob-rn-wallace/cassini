@@ -608,6 +608,11 @@ debugging-only hack, kept in place.
 
 ### Current blocker: ROM memory footprint exceeds the Pico 2's RAM
 
+**Hardware ordered to resolve this: a Pimoroni Pico Plus 2 (RP2350B +
+8 MiB PSRAM), in transit as of 2026-08-13** — see "PSRAM research"
+below for what's already been confirmed while waiting for it to
+arrive, including a fifth option better than any of the original four.
+
 The build is fully clean (strict warnings on this project's own files,
 same split as everywhere else) and flashes successfully. At runtime it
 correctly reproduces the exact same cold-boot WARNING cascade the host
@@ -660,6 +665,13 @@ or heap overhead.
    this without touching vendored code at all.
 4. Reconsider scope — accept that a full real-ROM boot isn't achievable
    on this specific board with the core's current architecture as-is.
+5. **(Added after ordering PSRAM hardware, see "PSRAM research" below)**
+   Relocate the newlib `malloc()` heap itself into PSRAM, instead of
+   changing what or how `saturn_core` allocates. If it works, this is
+   the only option of the five that requires **zero edits to the
+   vendored core** — `romram48.c`/`romram49.c`'s existing `malloc()`
+   calls would simply succeed unmodified. Not yet verified — needs the
+   real board.
 
 Whichever path is chosen, it will be **this project's first edit to
 the vendored `saturn_core` submodule** (options 1-2) or a hardware
@@ -673,7 +685,91 @@ keeps `saturn_core/`'s own git identity pristine (a fresh
 `git submodule update --init` still gets the exact pinned upstream
 commit) while the modification stays fully visible/auditable as a diff
 in this repo, the same pattern Debian packages and Homebrew formulas
-use for "vendor a dependency, need one small patch."
+use for "vendor a dependency, need one small patch." Option 5 is the
+one exception to that framing — if it works, there's no vendored-code
+edit and no patch file to maintain at all.
+
+### PSRAM research (while hardware is in transit)
+
+Two things confirmed by direct source inspection, not assumption,
+while waiting for the Pico Plus 2 to arrive:
+
+**`x48` was re-checked and shares the identical memory problem — not a
+viable escape hatch.** Re-cloned it fresh and read `romio.c` directly:
+`unsigned char *rom` and its own unpacking logic (`*size = 2 *
+st.st_size` when a packed-format ROM is detected) confirm the exact
+same one-byte-per-nibble in-memory representation as `saturnng`.
+Switching cores would hit the identical inflation, while also losing
+49G/50G support entirely and `saturnng`'s cleaner core/UI separation.
+This appears to be an inherited convention across the whole
+Saturn-emulator lineage, not a `saturnng`-specific mistake — reinforces
+that the fix has to be about *where*/*how* memory is stored, not which
+core is vendored.
+
+**The HP49G/50G Flash-ROM struct is actually smaller than the
+48-series one, under today's unmodified code** — a real reframing of
+which model is "harder," worth contrasting with the 48-series numbers
+above. Pulled straight from `bus.h`:
+
+```c
+#define N_FLASH_SIZE_49  2048 * 1024 * 2   /* 4 MiB, 1 byte/nibble */
+#define N_RAM_SIZE_49    512 * 1024 * 2    /* 1 MiB */
+
+struct BusStatus_49 {
+    Nibble flash[N_FLASH_SIZE_49];
+    Nibble ram[N_RAM_SIZE_49];
+    Nibble *ce2, *nce3;
+};
+```
+
+`romram49.c:134` mallocs this whole struct in one call — **~5 MiB**,
+confirmed, versus the 48-series' ~9.5 MiB. The difference is entirely
+the 48-series' oversized, unconditional 8 MiB `N_PORT_2_BANK_48`
+constant (a card slot the HP48SX doesn't even have in real hardware) —
+the 49/50G bus table has no equivalent field. So under this core's
+current memory design, HP50G is not the more memory-hungry target;
+HP48SX/GX (as currently constant-sized) is.
+
+**The local Pico SDK checkout (2.3.0) already has first-class,
+mainline support for this exact board and for PSRAM in general** —
+confirmed by reading the SDK tree directly:
+- `src/boards/include/boards/pimoroni_pico_plus2_rp2350.h` already
+  exists upstream, defining `PICO_PSRAM_CS_PIN` (GPIO 47) and
+  `PICO_PSRAM_SIZE_BYTES` (8 MiB) via `pico_board_cmake_set_default` —
+  no custom board file needed.
+- `src/rp2_common/hardware_psram/` (`psram.c`/`psram.h`) is a real,
+  mainline library: `psram_is_available()`, `psram_detect_size()`,
+  `__in_psram`/`__uninitialized_psram` placement attributes, a
+  `psram_or_malloc()` convenience macro. PSRAM init already runs
+  automatically during `runtime_init` (stage `"11080"`) unless
+  explicitly skipped.
+- PSRAM is mapped as its own linker region:
+  `pico_psram_region.template.ld` → `PSRAM(rwx): ORIGIN = 0x11000000,
+  LENGTH = ${PICO_PSRAM_SIZE_BYTES}`.
+
+**Critical nuance found the same way: PSRAM is not automatically part
+of the `malloc()` heap.** `section_heap.incl` hardcodes the `.heap`
+section to `> RAM` (ordinary on-chip SRAM), with an optional
+`HEAP_LOC`/`HEAP_LIMIT` linker-symbol override for exactly where it
+starts/ends — nothing merges PSRAM into it by default. So simply
+swapping boards and enabling PSRAM will **not**, by itself, make
+`saturn_core`'s existing `malloc()` call succeed; something has to
+route that allocation into PSRAM. That something is Option 5 above:
+override `HEAP_LOC`/`HEAP_LIMIT` at link time to point the whole heap
+into the `0x11000000`-based PSRAM region. Real, honest caveat:
+`bus_fetch_nibble()` runs on every single emulated instruction, so if
+ROM/RAM end up living in PSRAM instead of on-chip SRAM, QMI PSRAM
+access latency could meaningfully slow execution — this needs
+benchmarking on the real board, not assumed to be free. None of this
+can be verified without the physical chip (writes to `0x11000000`
+bus-fault with nothing backing them right now), so Option 5 stays
+recorded as the leading candidate to try first once hardware arrives,
+not yet adopted.
+
+`firmware/CMakeLists.txt` already has draft, off-by-default groundwork
+for this (`CASSINI_PSRAM_HEAP` CMake option, default board updated to
+`pimoroni_pico_plus2_rp2350`) — explicitly untested until the board is
+in hand.
 
 ## ROM images — bring your own
 

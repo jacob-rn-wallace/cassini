@@ -12,7 +12,13 @@ if (NOT DEFINED ENV{PICO_SDK_PATH} AND NOT PICO_SDK_PATH)
     set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/../pico-sdk)
 endif ()
 
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+# Was pico2 through the "Out of mem" discovery (see CLAUDE.md's
+# "Current blocker" section) - updated to the Pico Plus 2 now that
+# PSRAM hardware has been ordered specifically to resolve that
+# blocker. Still overridable the same way as before
+# (-DPICO_BOARD=... or the PICO_BOARD env var), e.g. to go back to
+# pico2 for any reason.
+set(PICO_BOARD pimoroni_pico_plus2_rp2350 CACHE STRING "Board type")
 
 include(pico_sdk_import.cmake)
 
@@ -109,6 +115,40 @@ target_link_libraries(cassini
         BITMAPTEXT
         LIBERATION_MONO_10
 )
+
+# EXPERIMENTAL / UNTESTED - see CLAUDE.md's "Current blocker" ->
+# "PSRAM research" section for the full reasoning. Off by default:
+# this cannot be verified without the real Pico Plus 2 in hand
+# (writes to the PSRAM address range bus-fault with no chip behind
+# them on any other board), and is not yet the chosen fix - it's
+# groundwork so it's ready to try the moment the board arrives.
+#
+# The Pico SDK maps PSRAM as its own linker region (PSRAM, ORIGIN =
+# 0x11000000, LENGTH = PICO_PSRAM_SIZE_BYTES - see
+# pico_standard_link/pico_psram_region.template.ld) but does NOT
+# merge it into the newlib malloc() heap by default (section_heap.incl
+# hardcodes .heap to the ordinary `RAM` region). If saturn_core's
+# existing romram48.c/romram49.c malloc(sizeof(struct BusStatus_*))
+# calls are ever going to succeed without editing saturn_core at all,
+# the heap itself has to be relocated into PSRAM via the HEAP_LOC/
+# HEAP_LIMIT linker-symbol overrides section_heap.incl already
+# supports for exactly this purpose.
+#
+# Real, unresolved caveat: bus_fetch_nibble() runs on every emulated
+# instruction. If ROM/RAM end up living in PSRAM instead of on-chip
+# SRAM, QMI PSRAM access latency could meaningfully slow execution -
+# needs benchmarking on real hardware, not assumed free.
+option(CASSINI_PSRAM_HEAP "EXPERIMENTAL/UNTESTED: relocate the newlib malloc() heap into PSRAM" OFF)
+if (CASSINI_PSRAM_HEAP)
+    if (NOT PICO_PSRAM_SIZE_BYTES)
+        set(PICO_PSRAM_SIZE_BYTES "(8 * 1024 * 1024)")
+    endif ()
+    math(EXPR CASSINI_PSRAM_HEAP_LIMIT "0x11000000 + (${PICO_PSRAM_SIZE_BYTES})" OUTPUT_FORMAT HEXADECIMAL)
+    target_link_options(cassini PRIVATE
+            "LINKER:--defsym=HEAP_LOC=0x11000000"
+            "LINKER:--defsym=HEAP_LIMIT=${CASSINI_PSRAM_HEAP_LIMIT}"
+    )
+endif ()
 
 pico_enable_stdio_usb(cassini 1)
 pico_enable_stdio_uart(cassini 0)
