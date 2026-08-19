@@ -8,10 +8,18 @@
  * by tests/saturn_smoke_test.c), then renders whatever's on the
  * emulated LCD once to the physical Sharp display and idles -
  * deliberately the same "draw once, then idle" shape as
- * lcd_bringup/main.c. No keyboard, no real-time timer-driven loop yet
- * - there's no physical keyboard hardware for this project yet, so
- * real-time interactivity is its own later phase. See CLAUDE.md's
- * "Native firmware" section.
+ * lcd_bringup/main.c. Still no keyboard (no physical keyboard hardware
+ * for this project yet) and still not real-time/wall-clock-throttled
+ * (deliberately bounded by instruction count, not by `Emulator()`'s
+ * own unbounded loop - Power of 10, Rule 2) - but the loop below now
+ * drives the real Saturn T1/T2 hardware timer registers the same way
+ * `saturn_core/src/core/emulator.c`'s own `EmulatorLoop()` does,
+ * instruction-count-paced instead of wall-clock-paced, since a first
+ * bring-up run confirmed (via a real nibble probe of the emulated LCD
+ * memory) that the ROM was sitting fully idle with a completely blank
+ * LCD buffer - consistent with waiting on a timer interrupt this
+ * harness never used to deliver at all. See CLAUDE.md's "Native
+ * firmware" section.
  */
 
 #include "hardware/flash.h"
@@ -41,6 +49,7 @@
 #include <sharpdisp/bitmaptext.h>
 #include <sharpdisp/sharpdisp.h>
 
+#include "hdw.h"
 #include "pins.h"
 #include "rom_syscalls.h"
 #include "saturn_lcd.h"
@@ -48,6 +57,29 @@
 /* Power of 10, Rule 2: same generous bring-up ceiling already proven
  * safe against this exact ROM by tests/saturn_smoke_test.c. */
 #define MAX_INSTR 2000000
+
+/* Real Saturn/HP48 hardware timer register control bits (hdw.t1_ctrl/
+ * hdw.t2_ctrl - hdw.h:52-57) and the real T2-ticks-per-T1-tick ratio
+ * (8192 Hz / 16 Hz). Copied verbatim from saturn_core/src/core/
+ * emulator.c's own file-local `T1_CTRL_*`/`T2_CTRL_*`/`T1_MULTIPLIER`
+ * macros (not exported via any header) - these are real HP48 hardware
+ * register bit meanings, not vendored implementation logic, the same
+ * "copy the reference behavior, don't touch the vendored file" posture
+ * saturn_lcd.c's own decode already uses. INSTR_PER_T2_TICK has no
+ * real-hardware equivalent - EmulatorLoop() paces T2 ticks by wall-clock
+ * time (T2_INTERVAL, ~122us/tick), which this deliberately
+ * non-real-time, instruction-count-bounded harness has no equivalent
+ * of; this just needs to tick "often enough" within MAX_INSTR to give
+ * the ROM's own timer setup a real chance to fire. */
+#define T1_CTRL_INT  0x02
+#define T1_CTRL_WAKE 0x04
+#define T1_CTRL_SREQ 0x08
+#define T2_CTRL_TRUN 0x01
+#define T2_CTRL_INT  0x02
+#define T2_CTRL_WAKE 0x04
+#define T2_CTRL_SREQ 0x08
+#define T1_MULTIPLIER ( 8192 / 16 ) /* real T2 ticks per T1 tick = 512 */
+#define INSTR_PER_T2_TICK 10
 
 #define PANEL_WIDTH_PX  400
 #define PANEL_HEIGHT_PX 240
@@ -310,11 +342,43 @@ int main( void )
     /* volatile: modified after setjmp(), read after a possible
      * longjmp() back into this frame from BadOpcodeHandler(). */
     volatile int executed = 0;
+    int t1_subcount = 0; /* T2 ticks accumulated toward the next T1 tick */
 
     if ( setjmp( bad_opcode_unwind ) == 0 ) {
         ChfPushHandler( CPU_CHF_MODULE_ID, BadOpcodeHandler, &bad_opcode_unwind, ( void* )NULL );
         for ( ; executed < MAX_INSTR; executed++ ) {
             OneStep();
+
+            /* Drive the real Saturn T1/T2 timer registers - see the
+             * T1_CTRL_.../T2_CTRL_.../T1_MULTIPLIER block above for
+             * the full rationale. T2 only ticks while the ROM has set
+             * T2_CTRL_TRUN (real hardware behavior - T1 has no such
+             * gate and always ticks). */
+            if ( executed % INSTR_PER_T2_TICK == 0 ) {
+                if ( hdw.t2_ctrl & T2_CTRL_TRUN ) {
+                    hdw.t2_val--;
+                    if ( hdw.t2_val == ( int )0xFFFFFFFF ) {
+                        hdw.t2_ctrl |= T2_CTRL_SREQ;
+                        if ( hdw.t2_ctrl & T2_CTRL_WAKE )
+                            CpuWake();
+                        if ( hdw.t2_ctrl & T2_CTRL_INT )
+                            CpuIntRequest( INT_REQUEST_IRQ );
+                    }
+                }
+
+                if ( ++t1_subcount >= T1_MULTIPLIER ) {
+                    t1_subcount = 0;
+                    hdw.t1_val = ( hdw.t1_val - 1 ) & NIBBLE_MASK;
+                    if ( hdw.t1_val == 0xF ) {
+                        hdw.t1_ctrl |= T1_CTRL_SREQ;
+                        if ( hdw.t1_ctrl & T1_CTRL_WAKE )
+                            CpuWake();
+                        if ( hdw.t1_ctrl & T1_CTRL_INT )
+                            CpuIntRequest( INT_REQUEST_IRQ );
+                    }
+                }
+            }
+
             if ( executed % 20000 == 0 )
                 LogLine( "...%d instr, pc=0x%05X", executed, cpu.pc );
         }

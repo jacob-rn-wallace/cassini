@@ -117,7 +117,14 @@ newlib syscall shim used to embed the ROM, the build fixes required,
 the debugging process (including two real bugs found and fixed along
 the way: a `hardware_psram`/`--gc-sections` linking trap, and a flash
 byte-padding bug in this project's own on-device debug logging), and
-exactly what was patched and why.
+exactly what was patched and why. Immediately after that, the same
+session went further: the bring-up loop was found to be idling forever
+because it never drove the real Saturn hardware timer registers
+`Emulator()` normally would — fixed entirely in `main.c` (zero further
+`saturn_core` changes), and the physical display now shows real,
+legible HP48SX firmware UI (a genuine "Try to Recover Memory?" prompt)
+for the first time. See "Timer-driven execution" (also under "Native
+firmware" below) for that account.
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -534,11 +541,17 @@ Phase 4: wires `saturn_core` + `firmware/saturn_compat/` +
 compiled-in HP48SX ROM and renders its emulated LCD to the physical
 Sharp display. Scope, confirmed with the user: a *static bring-up*
 milestone — run the CPU for a bounded instruction count (same safety
-pattern as `tests/saturn_smoke_test.c`), render once, idle. No
-keyboard, no real-time timer-driven loop — there's no physical keyboard
-hardware for this project yet, so real-time interactivity is its own
-later phase. **Done and verified on real hardware** — see "Resolved:
-ROM memory footprint" below for the full story of what that took.
+pattern as `tests/saturn_smoke_test.c`), render once, idle. Still no
+keyboard (no physical keyboard hardware for this project yet, so real
+interactivity is its own later phase) and still not wall-clock
+real-time (deliberately bounded by instruction count, not throttled to
+real time), but the loop now *does* drive the real Saturn hardware
+timer registers (instruction-count-paced rather than wall-clock-paced)
+— see "Timer-driven execution" below for why that turned out necessary
+and what it unlocked. **Done and verified on real hardware, including
+real, legible HP48SX firmware UI actually rendering** — see "Resolved:
+ROM memory footprint" and "Timer-driven execution" below for the full
+story of what that took.
 
 Build (needs a real ROM already embedded — see "ROM embedding" below
 and `roms/README.md` first):
@@ -824,21 +837,17 @@ proved broadly useful):**
   chasing the actual PSRAM-config bug above, not as a standing
   requirement.
 
-**Confirmed real-hardware LCD state, for the record:** after the
+**Confirmed real-hardware LCD state, at the time:** after the
 2,000,000-instruction run, `hdw.lcd_base_addr`/`lcd_vlc`/`lcd_menu_addr`
 all held real, sane values (not zero/garbage) — the LCD controller
-state is genuinely initialized by the ROM's boot code. The physical
+state was genuinely initialized by the ROM's boot code. The physical
 panel showed no visible content at that point, but a direct nibble
 probe of the emulated LCD memory confirmed 0 of 340 sampled nibbles
-were nonzero — the display is correctly rendering a genuinely blank
-emulator LCD buffer, not hitting a render bug. Consistent with the
-CPU sitting at a near-constant `pc=0x01281` for nearly the entire run
-(instruction 20000 onward) — almost certainly idling on a timer/
-interrupt wait this deliberately non-interactive, non-timer-driven
-static-bring-up harness never drives (see "Native firmware" above's
-own scope note). Seeing real drawn content will need a later phase
-that actually feeds timer ticks and/or keyboard input, not a change to
-anything covered by this section.
+were nonzero — the display was correctly rendering a genuinely blank
+emulator LCD buffer, not hitting a render bug. Consistent with the CPU
+sitting at a near-constant `pc=0x01281` for nearly the entire run
+(instruction 20000 onward) — timer-idling, as confirmed and then fixed
+immediately below.
 
 **Real, still-open, deliberately deferred question:** whether QMI
 PSRAM access latency (`bus_fetch_nibble()` runs on every emulated
@@ -847,6 +856,73 @@ flagged as a real risk before hardware arrived. Not yet benchmarked —
 the 2,000,000-instruction run completed well within a few seconds
 either way, so it clearly isn't *prohibitively* slow, but no
 side-by-side on-chip-SRAM-vs-PSRAM timing comparison has been done.
+
+### Timer-driven execution: real HP48SX UI now rendering, 2026-08-19
+
+Same day as the PSRAM resolution above, immediately following it. The
+constant `pc=0x01281` idling noted above was root-caused precisely (not
+just guessed): `saturn_core/src/core/emulator.c`'s real `Emulator()`/
+`EmulatorLoop()` (never called by `main.c` — Power of 10, Rule 2 means
+this project's own bounded `OneStep()` loop is used instead) drives the
+real Saturn/HP48 hardware T1/T2 timer registers (`hdw.t1_val`/
+`t2_val`/`t1_ctrl`/`t2_ctrl`, `hdw.h:52-57`) between batches of
+`OneStep()` calls — real 16 Hz / 8192 Hz hardware timer rates
+(`T1_MULTIPLIER = 8192/16 = 512`), decrementing `t2_val` while
+`T2_CTRL_TRUN` is set (T1 has no such gate, always ticks), and on
+underflow setting a service-request bit plus calling `CpuWake()`/
+`CpuIntRequest(INT_REQUEST_IRQ)` per the `T*_CTRL_WAKE`/`T*_CTRL_INT`
+bits — all file-local to `emulator.c` (`T1_CTRL_*`/`T2_CTRL_*`
+constants, not exported via any header). `main.c`'s static bring-up
+loop was never calling any of this, so `hdw.t1_val`/`t2_val` simply sat
+frozen at their cold-reset values forever, and the ROM — correctly,
+per real hardware behavior — never got the timer interrupt it was
+waiting on.
+
+**Fix, entirely in `firmware/main.c`, zero `saturn_core` changes**:
+replicated the exact same decrement/underflow/wake logic
+`EmulatorLoop()` uses (same control-bit values, same `T1_MULTIPLIER`
+real-hardware ratio), copied as a comment-documented block the same
+"reference behavior, not vendored logic" way `saturn_lcd.c`'s LCD
+decode already was — these are real HP48 hardware register meanings,
+not this core's own implementation details. The one place this
+necessarily diverges from real hardware: `EmulatorLoop()` paces T2
+ticks by wall-clock time (`T2_INTERVAL` ≈ 122 µs); this project's
+harness is deliberately bounded by instruction count instead (Rule 2
+again — no unbounded/wall-clock-throttled loop), so ticks are paced by
+a plain `INSTR_PER_T2_TICK = 10` instruction-count cadence with no
+real-hardware equivalent, chosen only to tick "often enough" within
+`MAX_INSTR` to give the ROM's own timer setup a real chance to fire.
+
+**Result, confirmed both from the flash-persisted log and physically
+on the real display:** the CPU's PC now roams across a wide, varied
+range of addresses instead of sitting frozen at one — with a real,
+visible periodic pattern later in the run (near-identical PC sequences
+recurring roughly every 1,200,000 instructions), consistent with the
+calculator settling into a genuine idle/keyboard-scan loop woken by
+each timer tick, exactly the real intended HP48 OS behavior. Final
+`pc` at instruction 2,000,000 changed run-to-run (`0x0092C` observed),
+confirming real, varied execution rather than a fixed landing point.
+**The physical Sharp display now shows real, correctly-rendered,
+legible HP48SX firmware UI**: "Try to Recover Memory?" with YES/NO
+softkey labels at the bottom — the calculator's genuine memory-loss
+recovery prompt, real and expected behavior for a cold boot against
+completely fresh/empty emulated RAM (there is no saved calculator
+state anywhere in this setup, so the ROM correctly detects that and
+asks). This is real confirmation, for the first time, of the entire
+pipeline working correctly end to end on physical hardware: CPU
+execution, the PSRAM-backed memory subsystem, the timer/interrupt
+plumbing, and `saturn_lcd.c`'s LCD decode (bit ordering, 3x scaling,
+softkey label positioning) all producing genuine, readable calculator
+output.
+
+**Deliberately not yet done — a real, separate next step:** actually
+answering the YES/NO prompt needs keyboard input, and there's no
+physical keyboard wired to this project yet (per "Native firmware"
+above's own stated scope, keyboard/real-time interactivity was always
+planned as a later phase, not part of this static bring-up milestone).
+The likely minimal first step, not yet started: two GPIO buttons wired
+to whatever `keyboard.c` expects for just those two softkeys, rather
+than a full keypad.
 
 ## ROM images — bring your own
 
