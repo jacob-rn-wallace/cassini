@@ -1,0 +1,36 @@
+/* PSRAM-heap override for the Pico SDK's own section_heap.incl.
+
+   Only pulled in when CASSINI_PSRAM_HEAP is ON (firmware/CMakeLists.txt,
+   via pico_add_linker_script_override_path) - see CLAUDE.md's "Current
+   blocker" -> "PSRAM research" section for the full rationale.
+
+   The stock SDK file (pico_standard_link/script_include/section_heap.incl)
+   supports a HEAP_LOC/HEAP_LIMIT --defsym override for *where inside RAM*
+   the heap starts, but hardcodes the .heap output section to `> RAM` -
+   confirmed the hard way, via a real link error on this exact board:
+
+       address 0x11000800 of cassini.elf section `.heap' is not within
+       region `RAM'
+
+   --defsym alone cannot move an output section to a different memory
+   region; only the region assigned in the SECTIONS command controls
+   that. This file replaces the section wholesale, targeting `PSRAM`
+   instead of `RAM`.
+
+   Placed at __psram_end__ (exported by sections_psram.incl, included
+   just before this file in the default section list) rather than a
+   bare ORIGIN(PSRAM), so this stays correct even if this project ever
+   starts using __in_psram/__uninitialized_psram-tagged data elsewhere
+   - today nothing does, so __psram_end__ == ORIGIN(PSRAM) in practice.
+*/
+
+SECTIONS
+{
+    .heap __psram_end__ (NOLOAD):
+    {
+        __end__ = .;
+        end = __end__;
+        KEEP(*(.heap*))
+    } > PSRAM
+    __HeapLimit = ORIGIN(PSRAM) + LENGTH(PSRAM);
+}

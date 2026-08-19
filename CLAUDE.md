@@ -1,8 +1,11 @@
 # Saturn-Family HP Calculator Replica Project — Cassini
 
 Real Saturn-CPU-family calculator emulation running on a Raspberry Pi
-Pico 2, driving a real Sharp LS027B7DH01 memory LCD (400x240, on an
-Adafruit breakout board, #4694). Named for the Cassini space probe,
+Pico Plus 2 (RP2350B + 8 MiB PSRAM — the original target was a plain
+Pico 2, until a real hardware memory ceiling forced the move; see
+"Current status" below), driving a real Sharp LS027B7DH01 memory LCD
+(400x240, on an Adafruit breakout board, #4694). Named for the Cassini
+space probe,
 which orbited Saturn — a nod to the Saturn CPU architecture shared by
 HP's late-80s-through-2000s calculator lineage (48SX/48GX/40G/49G/50G,
 whichever of these the vendored core actually supports — see "The
@@ -89,30 +92,32 @@ confirmed working**: "Cassini" centered plus a border, rendered
 correctly on the real LS027B7DH01. Phase 3 is fully closed.
 
 **Phase 4 (wiring `saturn_core` + `firmware/saturn_compat/` +
-`sharpdisp/` into a real `firmware/` Pico SDK project) is in progress
-and currently blocked on a real hardware memory constraint, not a
-code bug.** The display-scaling decision from "Hardware" below is
-resolved (3x nearest-neighbor, 393x192 centered in the 400x240 panel,
-top 24px margin reserved for annunciator text labels — the user's
-explicit direction). A real `firmware/` project exists, builds cleanly,
-flashes successfully, and its `EmulatorInit()` cold-boot cascade
-matches the host smoke test's own proven WARNING-then-cold-reset
-behavior exactly — but it then panics with `Out of mem` while loading
-the ROM. Root cause, confirmed precisely: the vendored core stores each
-emulated nibble as a full byte (`typedef char Nibble`, deliberate but
-memory-inefficient — fine for the desktop-scale RAM this core was
-originally written against), so the unpacked 256 KiB HP48SX ROM alone
-needs 512 KiB of RAM — **exactly 100% of the Pico 2's entire 512 KiB
-SRAM** (confirmed directly from the linked binary's own memory map,
-not estimated), before counting the emulator's internal RAM/Port 1
-buffers, this project's own static data, the stack, or heap overhead.
-See "Native firmware (`firmware/`)" below for the full technical
-account — the newlib syscall shim used to embed the ROM, the build
-fixes required, the debugging process, and the precise blocker with
-the real options for resolving it (none yet chosen — paused for a
-decision, since every real fix requires either editing vendored core
-logic more deeply than this project has ever done, or different
-hardware).
+`sharpdisp/` into a real `firmware/` Pico SDK project) is done and
+verified on real hardware, including a real memory-ceiling blocker
+that forced a hardware change plus this project's first vendored-core
+patch — both now resolved and confirmed working.** The display-scaling
+decision from "Hardware" below is resolved (3x nearest-neighbor,
+393x192 centered in the 400x240 panel, top 24px margin reserved for
+annunciator text labels — the user's explicit direction). A real
+`firmware/` project builds cleanly, flashes successfully, and — on the
+Pico 2 — panicked with `Out of mem` while loading the ROM, root-caused
+precisely to the vendored core's one-byte-per-nibble storage plus an
+oversized `N_PORT_2_BANK_48` constant (~9.5 MiB in one `malloc()`
+against the Pico 2's 512 KiB SRAM). That was resolved by moving to a
+**Pimoroni Pico Plus 2 (RP2350B + 8 MiB PSRAM)**, relocating the
+newlib heap into PSRAM via a custom linker-script override, and a
+single, narrow, patch-file-tracked edit to `saturn_core/src/core/bus.h`
+right-sizing that one constant. Real end-to-end confirmation: a full
+HP48SX ROM boot + a bounded 2,000,000-instruction run completed
+cleanly on the physical Pico Plus 2, landing at PC `0x0127D` with no
+bad opcode — the exact same final PC the host smoke test reports as a
+clean `PASS`. See "Native firmware (`firmware/`)" below, specifically
+"Resolved: ROM memory footprint," for the full technical account — the
+newlib syscall shim used to embed the ROM, the build fixes required,
+the debugging process (including two real bugs found and fixed along
+the way: a `hardware_psram`/`--gc-sections` linking trap, and a flash
+byte-padding bug in this project's own on-device debug logging), and
+exactly what was patched and why.
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -332,9 +337,16 @@ architecture Cassini specifically needs.
   `sharpdisp/`): 3 signal pins needed (CS/SCK/MOSI), board handles
   level-shifting/regulation from 3.3V logic on-board, default pinout
   CS=GP17/SCK=GP18/MOSI=GP19/spi0.
-- **MCU:** Raspberry Pi Pico 2 (RP2350), raw Pico C SDK — same choice as
-  soynut, for the same reason (RAM/flash headroom over an Uno-class
-  board).
+- **MCU:** Pimoroni Pico Plus 2 (RP2350B + 8 MiB PSRAM), raw Pico C SDK
+  — same choice as soynut's own MCU family, for the same reason
+  (RAM/flash headroom over an Uno-class board), upgraded from a plain
+  Pico 2 once real hardware testing hit a memory ceiling the Pico 2's
+  512 KiB SRAM couldn't clear even after right-sizing the vendored
+  core's oversized constants — see "Native firmware" below's "Resolved:
+  ROM memory footprint" section. Same physical footprint/pinout as a
+  stock Pico 2 (confirmed directly from Pimoroni's own mechanical
+  diagram and product claims), so the display wiring below is unchanged
+  by the swap.
 - **Scaling — per-model, not fixed.** Native resolution differs across
   the Saturn family: HP48SX/48GX/40G/49G are 131x64, HP50G is 131x80
   (see "The Saturn CPU core" above). The Sharp display's 240px height
@@ -356,13 +368,16 @@ architecture Cassini specifically needs.
   many bytes of ROM file to read — full `N_ROM_SIZE_48` for 48GX, half
   for 48SX. The Port 2 RAM/ROM card slot logic
   (`NCe3Init48`/`Read48`/`Write48`/`Save48`, `romram48.c:600-742`) is
-  gated by the compile-time macro `N_PORT_2_BANK_48`, which is
+  gated by the compile-time macro `N_PORT_2_BANK_48`, which **was**
   unconditionally defined to 32 (`bus.h:194`; the model-conditional
   version is commented out directly above it) — so it's fully compiled
   and exercised for **both** models regardless. 48SX and 48GX are
   therefore code-path-identical in this emulator core, differing only by
   ROM byte count. **HP48SX and HP48GX are tied for simplest** — pick
-  either.
+  either. (This constant is now patched to `1` in this project's own
+  checkout via `saturn_core.patch` — see "Native firmware" below's
+  "Resolved: ROM memory footprint" section. The code-path-identical
+  analysis above is unaffected; only the Port 2 buffer's size changed.)
 
   The other half of the original guess was backwards: **HP40G is not
   simpler than 49G/50G — it shares their full complexity.**
@@ -461,7 +476,15 @@ actual driver is the vendored `sharpdisp/` library (see its own
 `README.md`) rather than a project-local controller driver — the Sharp
 display's own library already covers that layer.
 
-Build:
+Build (`PICO_BOARD=pico2` below reflects Phase 3's original hardware;
+the project's board is now the Pico Plus 2 — see "Hardware" above and
+"Native firmware"'s "Resolved: ROM memory footprint" section. This
+exact project, unmodified, was re-run against
+`-DPICO_BOARD=pimoroni_pico_plus2_rp2350` as a real diagnostic step
+during that PSRAM debugging, in its own separate `build_plus2/`
+directory, and confirmed the same "Cassini" text + border rendering
+correctly on the new board too — real evidence the physical wiring
+swap didn't need any code changes):
 
 ```
 export PICO_SDK_PATH=~/pico/pico-sdk      # or wherever your checkout is
@@ -514,7 +537,30 @@ milestone — run the CPU for a bounded instruction count (same safety
 pattern as `tests/saturn_smoke_test.c`), render once, idle. No
 keyboard, no real-time timer-driven loop — there's no physical keyboard
 hardware for this project yet, so real-time interactivity is its own
-later phase.
+later phase. **Done and verified on real hardware** — see "Resolved:
+ROM memory footprint" below for the full story of what that took.
+
+Build (needs a real ROM already embedded — see "ROM embedding" below
+and `roms/README.md` first):
+
+```
+export PICO_SDK_PATH=~/pico/pico-sdk      # or wherever your checkout is
+export PATH=~/pico/arm-gnu-toolchain/bin:$PATH
+cd firmware && mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release        # PICO_BOARD defaults to pimoroni_pico_plus2_rp2350,
+                                            # CASSINI_PSRAM_HEAP defaults ON - both required for
+                                            # this board, see "Resolved: ROM memory footprint" below
+make -j
+picotool load -f -x cassini.uf2            # -f forces BOOTSEL automatically, no button needed
+```
+
+Reading back the on-device debug log after a run (see "Resolved: ROM
+memory footprint" below for what this is):
+
+```
+picotool save -r 0x10FF0000 0x11000000 -t bin out.bin -f
+strings -a out.bin
+```
 
 **Display layout**, per the user's explicit direction: the native
 HP48SX 131x64 LCD scaled 3x (393x192), centered in the 400x240 panel —
@@ -592,7 +638,7 @@ the host build)
   the host build, fixed identically via a `-include unistd.h`
   force-include scoped to just that one file.
 
-### The `stdio_usb_connected()` gotcha
+### The `stdio_usb_connected()` gotcha — and why blocking on it was later removed
 
 `main.c` originally used a fixed `sleep_ms(1500)` before its first
 `printf()`, guessing that was "enough time" for a USB serial terminal
@@ -600,176 +646,207 @@ to attach. `pico_stdio_usb`'s CDC output is **silently dropped** when
 written before a real terminal has connected — no fixed delay can
 guarantee that in general, and it cost real debugging time (several
 flash-wait-check cycles showing "nothing" over serial that were fully
-explained by this, not a firmware bug). Fixed by blocking on
+explained by this, not a firmware bug). First fixed by blocking on
 `stdio_usb_connected()` (`pico/stdio_usb.h`) in a loop before printing
-anything, so no boot output is ever lost regardless of how long the
-user takes to attach a terminal — a real, permanent fix, not a
-debugging-only hack, kept in place.
+anything, so no boot output was ever lost regardless of how long a
+terminal took to attach.
 
-### Current blocker: ROM memory footprint exceeds the Pico 2's RAM
+**That block was later removed once it started actively hurting
+debugging, once the host machine's serial terminal turned out to be
+unreliable enough to matter (see "Resolved: ROM memory footprint"
+below).** Gating literally all progress — including the on-screen log
+and physical display — on a serial terminal successfully connecting
+defeated the entire point of adding a no-terminal-required status
+channel: a run would sit at "Booting..." on the physical panel
+indefinitely if nothing ever managed to open the serial port, even
+though the board itself was fine. `stdio_init_all()` is still called
+(so a terminal can still attach at any point and see everything from
+then on), but `main()` no longer waits for it - `printf()` output is
+simply dropped if nothing is attached yet, same as it always was
+before a terminal connects; the panel and the flash-persisted log are
+now the primary, always-available channels.
 
-**Hardware ordered to resolve this: a Pimoroni Pico Plus 2 (RP2350B +
-8 MiB PSRAM), in transit as of 2026-08-13** — see "PSRAM research"
-below for what's already been confirmed while waiting for it to
-arrive, including a fifth option better than any of the original four.
+### Resolved: ROM memory footprint exceeded the Pico 2's RAM
 
-The build is fully clean (strict warnings on this project's own files,
-same split as everywhere else) and flashes successfully. At runtime it
-correctly reproduces the exact same cold-boot WARNING cascade the host
-smoke test already proved (`ERROR: Can't open file
-[/nonexistent-cassini-state-path]` / `WARNING: Can't restore CPU status
-from disk; resetting CPU`) — real evidence the newlib syscall shim and
-compat layer are wired correctly. It then panics: `*** PANIC *** / Out
-of mem`.
+**Fully resolved and confirmed working on real hardware, 2026-08-19.**
+The board is now a **Pimoroni Pico Plus 2 (RP2350B + 8 MiB PSRAM)**,
+physically wired identically to the earlier Pico 2 (same pinout, see
+"Hardware" above), and a real HP48SX ROM boot + a bounded
+2,000,000-instruction run now completes cleanly on it — landing at PC
+`0x0127D` with no bad opcode, the exact same final PC the host smoke
+test (`tests/saturn_smoke_test.c`) reports as a clean `PASS`. This
+section keeps the full original debugging history (root cause, options
+considered, PSRAM research done while the board was in transit) below,
+followed by exactly what was actually done to resolve it and the real
+bugs hit along the way.
 
-Root cause, confirmed precisely (not estimated): `romram48.c:117` does
-one `malloc(sizeof(struct BusStatus_48))` call. That struct's fields
-(`bus.h:183-196`) are ROM 1 MiB (`N_ROM_SIZE_48` — sized for the
-*larger* HP48GX ROM regardless of which model is selected at runtime,
-since model choice is a runtime `ui4x_config.model` value, not a
-compile-time branch), RAM 256 KiB, Port 1 256 KiB, and **Port 2 8 MiB**
-(`N_PORT_2_BANK_48` hardcoded to `32` — `bus.h`'s own comment says the
-intended default was `8` (1 MiB), with a commented-out
-model-conditional line directly above showing the original design,
-`config.model == MODEL_48GX ? 32 : 1`, disabled at some point upstream
-in favor of the unconditional value. HP48SX doesn't have this card slot
-in real hardware at all.) Total: **~9.5 MiB requested in one call**,
-against the Pico 2's actual total SRAM, confirmed directly from the
-linked binary's own memory map (`RAM 0x20000000, length 0x00080000` =
-exactly 512 KiB, not estimated from a datasheet).
+**Original root cause, on the Pico 2 (confirmed precisely, not
+estimated):** `romram48.c:117` does one
+`malloc(sizeof(struct BusStatus_48))` call. That struct's fields
+(`bus.h:183-196`) were ROM 1 MiB (`N_ROM_SIZE_48` — sized for the
+*larger* HP48GX ROM regardless of which model is selected at runtime),
+RAM 256 KiB, Port 1 256 KiB, and **Port 2 8 MiB** (`N_PORT_2_BANK_48`
+hardcoded to `32` — `bus.h`'s own comment says the intended default was
+`8` (1 MiB), with a commented-out model-conditional line directly
+above showing the original design, `config.model == MODEL_48GX ? 32 :
+1`, disabled at some point upstream in favor of the unconditional
+value. HP48SX doesn't have this card slot in real hardware at all.)
+Total: ~9.5 MiB requested in one call, against the Pico 2's actual
+512 KiB SRAM. Separately, the vendored core stores every emulated
+nibble as a full byte (`typedef char int4; typedef int4 Nibble;`,
+`types.h`) — deliberate but memory-inefficient — so even after
+right-sizing the other three constants, the 256 KiB HP48SX ROM alone
+still needs 512 KiB unpacked, **100% of the Pico 2's entire SRAM**
+before counting anything else. Confirmed non-viable escape hatches at
+the time: `x48` shares the identical one-byte-per-nibble
+representation (re-checked directly in `romio.c`), so switching cores
+wouldn't have helped and would have cost 49G/50G support.
 
-Eliminating Port 2 entirely and right-sizing the other three constants
-to real HP48SX-accurate values is **necessary but not sufficient**: the
-vendored core stores every emulated nibble as a full byte
-(`typedef char int4; typedef int4 Nibble;`, `types.h`) — deliberate,
-but memory-inefficient, evidently fine for the desktop-scale RAM this
-core was originally written against. The 256 KiB HP48SX ROM file,
-unpacked at 1 byte per nibble, needs **512 KiB just for the ROM array
-alone — exactly 100% of the Pico 2's entire 512 KiB SRAM**, before
-counting the emulator's own RAM/Port 1 buffers, this project's own
-static data (~18 KiB, confirmed via `arm-none-eabi-size`), the stack,
-or heap overhead.
+**What was actually done — three pieces, all now confirmed working
+together:**
 
-**Real options, none yet chosen — paused for a decision:**
-1. Pack 2 nibbles per byte instead of 1 (halves ROM storage to a
-   fitting 256 KiB) — touches how the core addresses memory throughout
-   `bus_fetch_nibble()`/`bus_write_nibble()` and likely other call
-   sites, not just size constants; a materially bigger, riskier edit to
-   vendored logic than a constants-only patch.
-2. Reference the ROM directly from flash (XIP) instead of copying it
-   into RAM at all — the "right" embedded-systems answer (Pico has
-   4 MiB of flash; ROM is read-only data), but requires changing `rom`
-   from a fixed in-struct array to a pointer and adjusting how it's
-   addressed — also a deeper structural change than constants alone.
-3. Different/bigger hardware — a board with add-on PSRAM would sidestep
-   this without touching vendored code at all.
-4. Reconsider scope — accept that a full real-ROM boot isn't achievable
-   on this specific board with the core's current architecture as-is.
-5. **(Added after ordering PSRAM hardware, see "PSRAM research" below)**
-   Relocate the newlib `malloc()` heap itself into PSRAM, instead of
-   changing what or how `saturn_core` allocates. If it works, this is
-   the only option of the five that requires **zero edits to the
-   vendored core** — `romram48.c`/`romram49.c`'s existing `malloc()`
-   calls would simply succeed unmodified. Not yet verified — needs the
-   real board.
+1. **Hardware: Pimoroni Pico Plus 2 (RP2350B + 8 MiB PSRAM).** Same
+   physical footprint/pinout as a stock Pico 2 (Pimoroni's own product
+   claim, mechanically confirmed from their dimensioned diagram), so no
+   rewiring was needed when the board physically arrived — see
+   "Hardware" above for the exact pin mapping used, and its own
+   sourcing note for how that was verified before trusting it.
 
-Whichever path is chosen, it will be **this project's first edit to
-the vendored `saturn_core` submodule** (options 1-2) or a hardware
-change (option 3) or a scope change (option 4) — a real departure from
-the "vendored; never edited directly" posture stated since Phase 1, not
-something to decide unilaterally. If an edit is chosen, the
-recommended mechanism is a maintained patch file (e.g.
-`saturn_core.patch`, tracked in this repo, applied as a build step)
-rather than editing the submodule's checked-out files directly — that
-keeps `saturn_core/`'s own git identity pristine (a fresh
-`git submodule update --init` still gets the exact pinned upstream
-commit) while the modification stays fully visible/auditable as a diff
-in this repo, the same pattern Debian packages and Homebrew formulas
-use for "vendor a dependency, need one small patch." Option 5 is the
-one exception to that framing — if it works, there's no vendored-code
-edit and no patch file to maintain at all.
+2. **Relocate the newlib `malloc()` heap into PSRAM, via a linker
+   script override — not a plain `--defsym`.** The Pico SDK maps PSRAM
+   as its own region (`PSRAM(rwx): ORIGIN = 0x11000000, LENGTH =
+   PICO_PSRAM_SIZE_BYTES`, `pico_psram_region.template.ld`), but its
+   own `section_heap.incl` hardcodes the `.heap` output section to
+   `> RAM` regardless of any `HEAP_LOC`/`HEAP_LIMIT` `--defsym`
+   symbols — those only move the heap's *address*, not which memory
+   *region* the linker checks it against. First attempt at the
+   `--defsym`-only approach failed at link time with a real error
+   (`address 0x11000800 of cassini.elf section .heap' is not within
+   region RAM'`), proving this the hard way rather than by reading
+   ahead. The actual fix uses the SDK's own supported override
+   mechanism, `pico_add_linker_script_override_path()`, to substitute
+   this project's own `firmware/linker_overrides/section_heap.incl`
+   for the SDK's version — targeting `PSRAM` instead of `RAM`, placed
+   at `__psram_end__` (the symbol `sections_psram.incl` exports for
+   exactly this purpose). Wired up in `firmware/CMakeLists.txt` via the
+   `CASSINI_PSRAM_HEAP` option (now the default-on path for this
+   board). This is this project's zero-vendored-edit option — it alone
+   would not have been sufficient, though (see next item).
 
-### PSRAM research (while hardware is in transit)
+3. **One narrow, patch-file-tracked edit to `saturn_core`** — this
+   project's first — changing `bus.h`'s `N_PORT_2_BANK_48` from `32`
+   to `1`. Necessary because even with the heap correctly in PSRAM,
+   `struct BusStatus_48`'s unmodified ~9.5 MiB request still exceeded
+   the Pico Plus 2's 8 MiB PSRAM (confirmed by direct arithmetic before
+   ever flashing a build that would have failed) — the oversized Port 2
+   card-slot buffer (a slot HP48SX doesn't have in real hardware) was
+   still the entire problem, just now against an 8 MiB ceiling instead
+   of 512 KiB. The commented-out model-conditional replacement
+   (`config.model == MODEL_48GX ? 32 : 1`) doesn't compile as a fixed
+   struct-array size (a runtime-conditional macro can't size a
+   compile-time array), so the constant itself was reduced directly.
+   New total: ~1.75 MiB, comfortably inside 8 MiB. Tracked as
+   `saturn_core.patch` (repo root) rather than edited in place —
+   `firmware/CMakeLists.txt` applies it automatically and idempotently
+   at configure time (`git apply --reverse --check` first, to detect
+   whether it's already applied) via `execute_process()`, so
+   `saturn_core/`'s own pinned-submodule git identity stays pristine
+   and a fresh `git submodule update --init` still gets the exact
+   upstream commit — the patch file is the only thing this repo
+   actually commits, exactly the Debian/Homebrew-style mechanism
+   recorded as the plan before any of this was attempted.
 
-Two things confirmed by direct source inspection, not assumption,
-while waiting for the Pico Plus 2 to arrive:
+**Two real bugs found and fixed while getting real-hardware
+confirmation, both worth keeping on record:**
 
-**`x48` was re-checked and shares the identical memory problem — not a
-viable escape hatch.** Re-cloned it fresh and read `romio.c` directly:
-`unsigned char *rom` and its own unpacking logic (`*size = 2 *
-st.st_size` when a packed-format ROM is detected) confirm the exact
-same one-byte-per-nibble in-memory representation as `saturnng`.
-Switching cores would hit the identical inflation, while also losing
-49G/50G support entirely and `saturnng`'s cleaner core/UI separation.
-This appears to be an inherited convention across the whole
-Saturn-emulator lineage, not a `saturnng`-specific mistake — reinforces
-that the fix has to be about *where*/*how* memory is stored, not which
-core is vendored.
+- **`hardware_psram` must actually be linked, or PSRAM is silently
+  never configured at all.** `hardware/psram.h`'s own doc comment
+  states plainly that the static `PICO_PSRAM_SIZE_BYTES`/
+  `PICO_PSRAM_CS_PIN` config path (what this board's header sets) is
+  **never verified against real hardware** — only
+  `PICO_AUTO_DETECT_PSRAM` does that. Worse: this project's first
+  real-hardware attempt got a `malloc()` pointer inside the PSRAM
+  address range and a write that didn't crash, but read-back
+  verification failed — root-caused to `firmware/CMakeLists.txt` not
+  yet linking `hardware_psram` at all at that point, meaning
+  `psram.c`'s `runtime_init_setup_psram()` (which actually configures
+  the QMI peripheral's quad-SPI read/write command format for real
+  PSRAM protocol) was never compiled into the binary in the first
+  place — the linker region existed, but nothing had ever told the
+  QMI hardware how to actually talk to the chip. Fixed by adding
+  `hardware_psram` to `target_link_libraries`. Once linked,
+  `psram_detect_size()` (a real SPI READ-ID handshake, not just
+  config) confirmed a genuine 8 MiB chip, and the malloc/write/read-back
+  test passed cleanly. **Because this project's link uses
+  `--gc-sections`, and static linking only pulls a `.o` out of an
+  archive if some symbol from it is referenced, `main.c` keeps one
+  permanent call to `psram_is_available()`/`psram_get_size()`** —
+  removing it would silently regress PSRAM back to unconfigured, even
+  though the underlying `runtime_init` registration mechanism
+  (`.preinit_array.*`-family sections) is itself gc-section-safe once
+  linked in.
+- **A flash-based on-device debug log (added this session, see below)
+  had a real byte-padding bug on first attempt.** Padding an
+  in-progress flash write out to a page boundary using the buffer's
+  default zero-fill (`0x00`) permanently zeroed those trailing bytes
+  in flash, because `flash_range_program()` can only clear bits (1 →
+  0) — a later, longer flush could never write real content into
+  those same positions again, since they were already fully cleared.
+  Fixed by padding with `0xFF` (the erased state) instead, via an
+  explicit `memset()` before first use.
 
-**The HP49G/50G Flash-ROM struct is actually smaller than the
-48-series one, under today's unmodified code** — a real reframing of
-which model is "harder," worth contrasting with the 48-series numbers
-above. Pulled straight from `bus.h`:
+**Debugging infrastructure added this session, kept as standing
+tools in `firmware/main.c` (not removed once the blocker was found —
+proved broadly useful):**
+- An LED heartbeat (`PICO_DEFAULT_LED_PIN`, toggled once a second by a
+  hardware repeating-timer callback, independent of whatever `main()`
+  is doing) — real, physical proof the board is alive versus genuinely
+  wedged, which matters because this project's host-machine serial
+  terminal has been seriously unreliable (scripted `pyserial`/`stty`
+  opens hung on `open()` roughly 2 times out of 3, for reasons never
+  fully root-caused on the host side).
+- An on-screen scrolling log (`LogLine()`, `sharpdisp`-rendered
+  directly to the physical panel) showing exactly what `main()` is
+  doing at all times, replacing a fixed `stdio_usb_connected()` wait
+  that used to block *all* progress (screen included) on a serial
+  terminal actually attaching — removed once it became clear that
+  defeated the entire point of a no-terminal-required status channel.
+- A flash-persisted full log (`FlashLogAppend()`/`FlashLogFlush()`,
+  reserving the last 64 KiB of the Pico Plus 2's 16 MiB flash) readable
+  after the fact — even across a reset, or a run that scrolled past too
+  fast to read live — via `picotool save -r 0x10FF0000 0x11000000 -t
+  bin out.bin -f`. The `-f` forces the board out of application mode
+  automatically; no physical BOOTSEL button press needed for this or
+  for routine reflashing (`picotool load -f -x`/`picotool reboot -f
+  -u`) in the common case, confirmed working repeatedly once the board
+  stopped genuinely hanging (see the LED heartbeat bullet above)
+  — occasional manual BOOTSEL intervention was only ever needed while
+  chasing the actual PSRAM-config bug above, not as a standing
+  requirement.
 
-```c
-#define N_FLASH_SIZE_49  2048 * 1024 * 2   /* 4 MiB, 1 byte/nibble */
-#define N_RAM_SIZE_49    512 * 1024 * 2    /* 1 MiB */
+**Confirmed real-hardware LCD state, for the record:** after the
+2,000,000-instruction run, `hdw.lcd_base_addr`/`lcd_vlc`/`lcd_menu_addr`
+all held real, sane values (not zero/garbage) — the LCD controller
+state is genuinely initialized by the ROM's boot code. The physical
+panel showed no visible content at that point, but a direct nibble
+probe of the emulated LCD memory confirmed 0 of 340 sampled nibbles
+were nonzero — the display is correctly rendering a genuinely blank
+emulator LCD buffer, not hitting a render bug. Consistent with the
+CPU sitting at a near-constant `pc=0x01281` for nearly the entire run
+(instruction 20000 onward) — almost certainly idling on a timer/
+interrupt wait this deliberately non-interactive, non-timer-driven
+static-bring-up harness never drives (see "Native firmware" above's
+own scope note). Seeing real drawn content will need a later phase
+that actually feeds timer ticks and/or keyboard input, not a change to
+anything covered by this section.
 
-struct BusStatus_49 {
-    Nibble flash[N_FLASH_SIZE_49];
-    Nibble ram[N_RAM_SIZE_49];
-    Nibble *ce2, *nce3;
-};
-```
-
-`romram49.c:134` mallocs this whole struct in one call — **~5 MiB**,
-confirmed, versus the 48-series' ~9.5 MiB. The difference is entirely
-the 48-series' oversized, unconditional 8 MiB `N_PORT_2_BANK_48`
-constant (a card slot the HP48SX doesn't even have in real hardware) —
-the 49/50G bus table has no equivalent field. So under this core's
-current memory design, HP50G is not the more memory-hungry target;
-HP48SX/GX (as currently constant-sized) is.
-
-**The local Pico SDK checkout (2.3.0) already has first-class,
-mainline support for this exact board and for PSRAM in general** —
-confirmed by reading the SDK tree directly:
-- `src/boards/include/boards/pimoroni_pico_plus2_rp2350.h` already
-  exists upstream, defining `PICO_PSRAM_CS_PIN` (GPIO 47) and
-  `PICO_PSRAM_SIZE_BYTES` (8 MiB) via `pico_board_cmake_set_default` —
-  no custom board file needed.
-- `src/rp2_common/hardware_psram/` (`psram.c`/`psram.h`) is a real,
-  mainline library: `psram_is_available()`, `psram_detect_size()`,
-  `__in_psram`/`__uninitialized_psram` placement attributes, a
-  `psram_or_malloc()` convenience macro. PSRAM init already runs
-  automatically during `runtime_init` (stage `"11080"`) unless
-  explicitly skipped.
-- PSRAM is mapped as its own linker region:
-  `pico_psram_region.template.ld` → `PSRAM(rwx): ORIGIN = 0x11000000,
-  LENGTH = ${PICO_PSRAM_SIZE_BYTES}`.
-
-**Critical nuance found the same way: PSRAM is not automatically part
-of the `malloc()` heap.** `section_heap.incl` hardcodes the `.heap`
-section to `> RAM` (ordinary on-chip SRAM), with an optional
-`HEAP_LOC`/`HEAP_LIMIT` linker-symbol override for exactly where it
-starts/ends — nothing merges PSRAM into it by default. So simply
-swapping boards and enabling PSRAM will **not**, by itself, make
-`saturn_core`'s existing `malloc()` call succeed; something has to
-route that allocation into PSRAM. That something is Option 5 above:
-override `HEAP_LOC`/`HEAP_LIMIT` at link time to point the whole heap
-into the `0x11000000`-based PSRAM region. Real, honest caveat:
-`bus_fetch_nibble()` runs on every single emulated instruction, so if
-ROM/RAM end up living in PSRAM instead of on-chip SRAM, QMI PSRAM
-access latency could meaningfully slow execution — this needs
-benchmarking on the real board, not assumed to be free. None of this
-can be verified without the physical chip (writes to `0x11000000`
-bus-fault with nothing backing them right now), so Option 5 stays
-recorded as the leading candidate to try first once hardware arrives,
-not yet adopted.
-
-`firmware/CMakeLists.txt` already has draft, off-by-default groundwork
-for this (`CASSINI_PSRAM_HEAP` CMake option, default board updated to
-`pimoroni_pico_plus2_rp2350`) — explicitly untested until the board is
-in hand.
+**Real, still-open, deliberately deferred question:** whether QMI
+PSRAM access latency (`bus_fetch_nibble()` runs on every emulated
+instruction) meaningfully slows execution versus on-chip SRAM was
+flagged as a real risk before hardware arrived. Not yet benchmarked —
+the 2,000,000-instruction run completed well within a few seconds
+either way, so it clearly isn't *prohibitively* slow, but no
+side-by-side on-chip-SRAM-vs-PSRAM timing comparison has been done.
 
 ## ROM images — bring your own
 

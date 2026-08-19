@@ -1,0 +1,13 @@
+diff --git a/src/core/bus.h b/src/core/bus.h
+index 4aa625b..c75a9d9 100644
+--- a/src/core/bus.h
++++ b/src/core/bus.h
+@@ -191,7 +191,7 @@ typedef enum {
+    The default value is 8, that is, Port_2 is emulated and its size is 1Mbyte.
+  */
+ // #define N_PORT_2_BANK_48 ( config.model == MODEL_48GX ? 32 : 1 )
+-#  define N_PORT_2_BANK_48 32
++#  define N_PORT_2_BANK_48 1
+ /* 2.4: Port_2 (NCE3) size */
+ #  define N_PORT_2_SIZE_48 N_PORT_2_BANK_48 * 128 * 1024 * 2
+ 
