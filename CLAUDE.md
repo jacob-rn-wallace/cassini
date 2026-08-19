@@ -1023,6 +1023,17 @@ assumed. Cropped to just the keyboard region by this project's own
 user before being added to the repo; redistributing it (or this repo)
 must keep this attribution and the CC BY-SA 3.0 license per its terms.
 
+**One-click launcher**: `tools/run_keyboard_gui.sh`, modeled on
+soynut's own `sim/run_with_gui.sh` but much simpler - that script
+starts a host-native simulator process and auto-discovers its virtual
+serial port before launching the GUI; Cassini has no host-native
+simulator yet (`sim/` is still empty), and the emulator runs on the
+real physical board, so this just runs
+`python3 hp48_keyboard_gui.py` directly - `find_port()` already
+auto-detects the board's USB serial port on its own. Confirmed
+working: launched cleanly, found the port, connected, and opened the
+window with no errors.
+
 **Verified working, with one real bug found and left open**:
 - A neutral key (N7, `0x33`) presses and releases cleanly, confirmed
   via a real scripted serial test (not the GUI itself, which needs a
