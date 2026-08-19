@@ -1208,6 +1208,184 @@ for whatever comes next on this bug, the same "kept as a standing
 debug facility" precedent the flash-persisted boot log itself already
 established.
 
+### HardFault_Handler installed - true-lockup theory confirmed, real crash site identified, 2026-08-19
+
+Same day, resumed later in the session at the user's explicit request
+("resume the hard-fault diagnostic"). Implements exactly the next step
+the prior section left open, and **fully confirms the working
+hard-fault theory with real captured register state - not just
+circumstantial evidence anymore.**
+
+**Implementation, `firmware/main.c`:** `isr_hardfault()`, a naked
+function overriding `pico_crt0/crt0.S`'s weak `isr_hardfault` stub
+directly (confirmed via direct disassembly of the linked `.elf` that
+this correctly replaces the default `decl_isr_bkpt` trap, and that the
+vector table's HardFault entry, word index 3, points to it). Uses the
+standard Cortex-M pattern - `EXC_RETURN` bit 2 (in `lr` at fault entry)
+selects `mrs r0, msp` vs `mrs r0, psp` to recover the hardware-pushed
+8-word exception frame (`r0-r3, r12, lr, pc, psr`), then tail-branches
+(`b`, not `bl` - it never returns) to `HardFaultHandlerC()`, a normal
+`__attribute__((noreturn))` C function. Deliberately **not** implemented
+via `hardware_exception`'s `exception_set_exclusive_handler()` - that
+API explicitly asserts if used to override a link-time strong symbol,
+and can't hand the handler the exception stack frame regardless; naked
++ a strong `isr_hardfault` definition is the standard, minimal way to
+get both on Cortex-M. `HardFaultHandlerC()` reads the stacked registers
+plus `scb_hw->cfsr/hfsr/mmfar/bfar` (the real Cortex-M33 fault-status
+registers, via the Pico SDK's own `hardware/structs/scb.h` - no need
+for raw address pokes), formats one `HARDFAULT ...` line into the
+existing `PsramTraceAppend()`/`FlushTraceToFlash()` machinery (see the
+prior section - already proven not to perturb the bug's timing, and
+this is the terminal state regardless so perturbation no longer
+matters), calls `DumpCpuState("FAULT-saturn", 0)` to capture the
+Saturn CPU's own state at the same moment, then dead-ends into a fast
+LED blink loop (a bare busy-wait, no SDK timer/interrupt dependency -
+deliberately distinct from `LedHeartbeat()`'s normal 1 Hz rhythm, so
+the physical board can signal "a fault was caught and handled" versus
+"still running normally" with no serial connection needed at all).
+Builds cleanly under this project's strict `-Wall -Wextra -Wpedantic
+-Werror` (two real fixes needed: `__attribute__((used))` on
+`HardFaultHandlerC`, since the compiler can't see the naked asm's `b`
+as a real call site and would otherwise let `--gc-sections`/`-Werror`
+drop or reject it as dead code; and a larger `snprintf` buffer, caught
+by `-Wformat-truncation` before it could silently truncate real fault
+data).
+
+**Confirmed working exactly as intended, on real hardware, on the
+first real repro attempt after flashing:** repeated YES-keypress
+attempts via a scripted serial test eventually reproduced a lockup:
+board unresponsive to the test script, `picotool`'s `-f` forced-BOOTSEL
+reboot failed (needing the same manual physical BOOTSEL intervention
+prior true-lockup reproductions in this investigation already needed)
+- but the onboard LED was doing a fast, visibly-distinct blink, not the
+normal 1 Hz heartbeat and not dark. That is direct, physical
+confirmation the new handler ran and reached its terminal blink loop,
+on exactly the failure mode that used to be a genuine, silent,
+undiagnoseable lockup.
+
+**The captured trace closes the "why doesn't even the watchdog fire"
+question directly.** Read back via the same
+`picotool save -r 0x10FF0000 0x11000000 -t bin out.bin -f`/`strings -a`
+method used throughout this investigation (this time needing a manual
+BOOTSEL entry first, since `-f` itself couldn't reach the board -
+consistent with everything above). The last two lines of the flushed
+trace:
+
+```
+HARDFAULT pc=1000275E lr=10005DF1 psr=09100000 r0=00070000 r1=117C1220 r2=736C2030 r3=73682030 r12=20002F18 cfsr=00008200 hfsr=40000000 mmfar=736C20D4 bfar=736C20D4
+FAULT-saturn s=0 pc=026CD p=0 hst=2 cy=1 ie=1 is=1 ip=1 rp=4 rs=020FA,80000,023ED,71B29,00000,00000,00000,00000 d=00138,7050C
+```
+
+Decoded directly against the real ARMv8-M CFSR/HFSR bit layout (not
+guessed - cross-checked against the Pico SDK's own
+`hardware/structs/scb.h` field comments): `cfsr=0x8200` has only bit 15
+(`BFSR_BFARVALID`) and bit 9 (`BFSR_PRECISERR`) set, and every other
+field (including all of `MMFSR`, the low byte) is zero - a real,
+precise (synchronous, exact-PC) **BusFault**, with a valid `BFAR`. No
+`UsageFault`/`MemManage` bits are set at all, ruling those fault
+classes out directly rather than by assumption. `hfsr=0x40000000` has
+only bit 30 (`FORCED`) set - confirming this BusFault was escalated
+into HardFault specifically because `BUSFAULTENA`
+(`SCB->SHCSR`) was never enabled (this project's firmware never touches
+it) - i.e., exactly the "unhandled/unrouted fault" scenario the prior
+section's working theory predicted, now confirmed from real captured
+hardware state instead of inferred from absence of watchdog activity.
+This also directly explains *why* even the independent LED-heartbeat
+timer IRQ couldn't preempt the true-lockup failure mode before this
+session's fix: with no `isr_hardfault` override, the weak default
+(`decl_isr_bkpt`, an unconditional `bkpt` trap) executes with no
+debugger attached, which on real hardware is a fault-generating
+instruction in its own right - taken while the core is already at
+HardFault's priority (the highest configurable priority on this part),
+i.e. exactly the scenario ARMv8-M defines as unrecoverable **lockup**
+state, which halts the processor until an external reset. That's a
+strictly worse, unobservable dead end - not just "interrupts masked
+while a handler runs" - which is exactly why nothing, including
+`picotool -f`, could ever reach the board during a true-lockup
+reproduction before this fix, and exactly why installing a real
+handler (which executes instead of re-faulting) turns that same
+underlying bug into a clean, deterministic, diagnosable halt instead.
+
+**The faulting address itself pinpoints the exact defect, in real
+(never-edited) vendored code:** `pc=0x1000275E` /
+`lr=0x10005DF1` resolve via `arm-none-eabi-addr2line` to
+`saturn_core/src/core/bus.c:580`, inside `cache__unconfig_get()`,
+called (per the resolved `lr`) directly from `OneStep()`
+(`saturn_core/src/core/cpu.c:2546`). The disassembly around the fault
+matches the source exactly:
+
+```c
+static bus_map_t* cache__unconfig_get( int i )
+{
+    bus_map_t* p = BUS_MAP.cache.unconfig[ i ];
+
+    while ( p != ( bus_map_t* )NULL && !p->cache.config_point )  /* <- faults here */
+        p = p->cache.unconfig[ i ];
+
+    return p;
+}
+```
+
+`p` (loaded from `BUS_MAP.cache.unconfig[i]`, part of `saturnng`'s own
+`USE_BUS_CACHE` module-configuration-cache linked-list machinery,
+`bus.c`/`bus.h` - not this project's code) is a garbage, wildly
+out-of-range pointer by the time this runs: `bfar`/`mmfar` (the actual
+faulting bus address) is `0x736C20D4`, nowhere near any of this
+board's real address ranges (flash/XIP at `0x10000000`, SRAM at
+`0x20000000`, PSRAM at `0x11000000`, peripherals at `0x40000000+`) -
+and its top bytes read as plausible ASCII (`0x73='s' 0x6C='l' 0x20=' '`)
+- a strong sign of a stale/corrupted pointer rather than a
+straightforward off-by-one or null-deref. `N_BUS_SIZE` (the small,
+fixed dimension `i`/`mod` ranges over, `bus.h:180`) is a hardcoded `6`,
+completely unrelated to `N_PORT_2_BANK_48` - so the array-index
+dimension itself isn't in question here; the corruption is in the
+*pointer value stored at* that index, meaning something elsewhere
+wrote a bad `bus_map_t*` into the cache (a stale/freed pointer, a
+reference-counting bug in `bus_map__free()`/`cache__flush_except()`, or
+heap corruption from some other source entirely) - not yet
+root-caused further than this.
+
+**One real, concrete alternate-cause hypothesis was investigated and
+explicitly ruled out, not assumed away**, given this project's own
+`saturn_core.patch` already changes a Port-2-related constant:
+`NCe3Read48()`/`NCe3Write48()` (`romram48.c:704`/`738`) index
+`bus_status_48->port_2[]` with `rel_address | hdw.accel.a48.bs_address`,
+and `bs_address` itself (`romram48.c:403`) is computed as
+`((bank_bits) << 18) & (N_PORT_2_SIZE_48 - 1)` - i.e. **already
+self-masks against the patched (not the original) buffer size**, so
+this can't read/write out of bounds regardless of `N_PORT_2_BANK_48`'s
+value. Checked directly with real arithmetic (`N_PORT_2_BANK_48=1` ->
+`N_PORT_2_SIZE_48=0x40000`, mask `=0x3FFFF`, exactly 18 bits - but the
+bank-select bits are pre-shifted left by 18 before that mask is
+applied, so they land entirely *above* the mask's 18 covered bits and
+always get zeroed): for every bank number 0-31, the resulting
+`bs_address` is `0x0`. **This is memory-safe** (not the crash's cause -
+ruled out with real computation, not assumption) **but is a real,
+previously-undocumented separate functional bug this project's own
+patch introduced**: with `N_PORT_2_BANK_48` reduced from 32 to 1,
+Port 2 bank-switching silently collapses to always addressing bank 0,
+regardless of which bank a ROM selects. Worth keeping in mind for
+correctness (a real Port 2 RAM/ROM card with >1 bank would misbehave
+under this patch), but a distinct issue from the crash under
+investigation here.
+
+**Left open, a real decision point rather than continuing to dig
+unilaterally**: root-causing *why* `BUS_MAP.cache.unconfig[i]` (or a
+link further down the chain it walks) ends up holding a bad
+pointer - candidates include a reference-counting/use-after-free bug in
+`saturnng`'s own `USE_BUS_CACHE` logic (`bus_map__free()`,
+`cache__flush_except()`, `cache__check_for_late_hit()`, all in `bus.c`,
+none of them touched by this project's one existing patch), or heap
+corruption originating somewhere else entirely and merely surfacing
+here. `USE_BUS_CACHE` (`bus.c:122`) is an unconditional
+`#define USE_BUS_CACHE 1` inside the vendored file itself, not a
+build-system flag - disabling it as a diagnostic (there's a real,
+already-present `#else` code path in `bus.c` for when it's undefined)
+would need a second tracked `saturn_core.patch`-style edit, which -
+per this project's "vendored, never edited directly" rule - needs the
+same explicit approval the existing `N_PORT_2_BANK_48` patch got, not
+a unilateral decision.
+
 ## ROM images — bring your own
 
 **The ROM files themselves are not in this repo, and never should be.**

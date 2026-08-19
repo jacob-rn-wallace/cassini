@@ -22,6 +22,7 @@
 #include "hardware/flash.h"
 #include "hardware/gpio.h"
 #include "hardware/psram.h"
+#include "hardware/structs/scb.h"
 #include "hardware/sync.h"
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
@@ -274,6 +275,93 @@ static void DumpCpuState( const char* label, long step )
 static long trace_remaining = 0;
 #define TRACE_STEP_INTERVAL 20
 #define TRACE_LENGTH_INSTR  3000
+
+/* TEMPORARY diagnostic - the next concrete step in the YES-path
+ * bad-opcode investigation (see CLAUDE.md's "YES-path bad-opcode
+ * investigation" section): the true-lockup failure mode observed
+ * there never let even the independent LedHeartbeat() watchdog IRQ
+ * run, which on ARMv8-M strongly suggests an unhandled fault has
+ * raised execution priority high enough to mask ordinary interrupts.
+ * A fault handler itself runs at a priority ordinary interrupts can't
+ * preempt, so - unlike the watchdog - it can still capture state even
+ * in that case. This is the working theory from that investigation,
+ * not yet confirmed; this handler exists to confirm or rule it out.
+ *
+ * HardFaultHandlerC() never returns - once a real hard fault happens,
+ * continuing to run the faulted CPU state (or app tries to resume
+ * OneStep()) risks corrupting whatever it's about to write out, so
+ * this deliberately dead-ends into a fast LED blink loop (distinct
+ * from LedHeartbeat()'s normal 1 Hz rhythm) after flushing everything
+ * it can to flash - a permanent halt, the same posture the
+ * BadOpcodeHandler()/longjmp path below already takes for a
+ * recoverable-but-still-fatal condition.
+ */
+/* __attribute__((used)): only ever referenced from isr_hardfault()'s
+ * inline asm below (`b HardFaultHandlerC`), which the compiler can't
+ * see as a real call site - without this, --gc-sections plus this
+ * project's -Werror would drop/reject it as apparently dead code. */
+static void __attribute__( ( noreturn, used ) ) HardFaultHandlerC( uint32_t* stack_frame )
+{
+    const uint32_t r0 = stack_frame[ 0 ];
+    const uint32_t r1 = stack_frame[ 1 ];
+    const uint32_t r2 = stack_frame[ 2 ];
+    const uint32_t r3 = stack_frame[ 3 ];
+    const uint32_t r12 = stack_frame[ 4 ];
+    const uint32_t lr = stack_frame[ 5 ];
+    const uint32_t pc = stack_frame[ 6 ];
+    const uint32_t psr = stack_frame[ 7 ];
+    const uint32_t cfsr = scb_hw->cfsr;
+    const uint32_t hfsr = scb_hw->hfsr;
+    const uint32_t mmfar = scb_hw->mmfar;
+    const uint32_t bfar = scb_hw->bfar;
+
+    char line[ 200 ];
+    snprintf( line, sizeof( line ),
+              "HARDFAULT pc=%08lX lr=%08lX psr=%08lX r0=%08lX r1=%08lX r2=%08lX r3=%08lX r12=%08lX "
+              "cfsr=%08lX hfsr=%08lX mmfar=%08lX bfar=%08lX",
+              ( unsigned long )pc, ( unsigned long )lr, ( unsigned long )psr, ( unsigned long )r0, ( unsigned long )r1,
+              ( unsigned long )r2, ( unsigned long )r3, ( unsigned long )r12, ( unsigned long )cfsr, ( unsigned long )hfsr,
+              ( unsigned long )mmfar, ( unsigned long )bfar );
+    PsramTraceAppend( line );
+    DumpCpuState( "FAULT-saturn", 0 );
+    FlushTraceToFlash();
+
+    for ( ;; ) {
+        gpio_put( PICO_DEFAULT_LED_PIN, true );
+        for ( volatile uint32_t i = 0; i < 500000; i++ ) { }
+        gpio_put( PICO_DEFAULT_LED_PIN, false );
+        for ( volatile uint32_t i = 0; i < 500000; i++ ) { }
+    }
+}
+
+/* TEMPORARY diagnostic - overrides crt0.S's weak isr_hardfault stub
+ * (pico_crt0/crt0.S: `.weak isr_hardfault` / `decl_isr_bkpt
+ * isr_hardfault`) directly, rather than going through
+ * exception_set_exclusive_handler() (hardware_exception): that API
+ * explicitly asserts if used to override a link-time strong symbol,
+ * and can't hand the handler the exception stack frame anyway - naked
+ * + a strong isr_hardfault definition is the standard, minimal way to
+ * get that on Cortex-M. EXC_RETURN (in LR at fault entry) bit 2 tells
+ * MSP vs. PSP; the 8-word hardware-pushed frame (r0-r3, r12, lr, pc,
+ * psr) lives at whichever one was active - this project never uses
+ * the FPU, so there's no extra FP state to skip. Tail-branches to
+ * HardFaultHandlerC (a normal, non-naked C function, [noreturn], so
+ * it never needs to return through this asm) with that frame pointer
+ * in r0.
+ */
+void __attribute__( ( naked ) ) isr_hardfault( void )
+{
+    __asm volatile( "movs r0, #4        \n"
+                     "mov  r1, lr        \n"
+                     "tst  r0, r1        \n"
+                     "beq  1f            \n"
+                     "mrs  r0, psp       \n"
+                     "b    2f            \n"
+                     "1:                 \n"
+                     "mrs  r0, msp       \n"
+                     "2:                 \n"
+                     "b    HardFaultHandlerC \n" );
+}
 
 static jmp_buf bad_opcode_unwind;
 static bool hit_bad_opcode;
