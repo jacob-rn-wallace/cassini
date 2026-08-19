@@ -1,25 +1,22 @@
 /**
  * @file main.c
- * @brief Real Cassini firmware entry point - static bring-up milestone.
+ * @brief Real Cassini firmware entry point - interactive.
  *
  * Boots a compiled-in HP48SX ROM (see roms/rom_to_c.py,
- * firmware/rom_syscalls.c) against the vendored saturn_core, runs it
- * for a bounded instruction count (same safety pattern already proven
- * by tests/saturn_smoke_test.c), then renders whatever's on the
- * emulated LCD once to the physical Sharp display and idles -
- * deliberately the same "draw once, then idle" shape as
- * lcd_bringup/main.c. Still no keyboard (no physical keyboard hardware
- * for this project yet) and still not real-time/wall-clock-throttled
- * (deliberately bounded by instruction count, not by `Emulator()`'s
- * own unbounded loop - Power of 10, Rule 2) - but the loop below now
- * drives the real Saturn T1/T2 hardware timer registers the same way
- * `saturn_core/src/core/emulator.c`'s own `EmulatorLoop()` does,
- * instruction-count-paced instead of wall-clock-paced, since a first
- * bring-up run confirmed (via a real nibble probe of the emulated LCD
- * memory) that the ROM was sitting fully idle with a completely blank
- * LCD buffer - consistent with waiting on a timer interrupt this
- * harness never used to deliver at all. See CLAUDE.md's "Native
- * firmware" section.
+ * firmware/rom_syscalls.c) against the vendored saturn_core, then runs
+ * indefinitely: driving the real Saturn T1/T2 hardware timer registers
+ * the same way `saturn_core/src/core/emulator.c`'s own `EmulatorLoop()`
+ * does (instruction-count-paced rather than wall-clock-paced - see
+ * INSTR_PER_T2_TICK's comment), polling incoming USB-serial bytes for
+ * key press/release commands (see PollKeyboardInput()) and injecting
+ * them via the vendored core's own `KeybPress()`/`KeybRelease()`, and
+ * redrawing the physical Sharp display on a wall-clock cadence. Power
+ * of 10, Rule 2's "bounded loops" doesn't fit an interactive device
+ * that's meant to run until powered off - documented as a deliberate
+ * exception in DEVIATIONS.md, the same posture soynut's own main loop
+ * takes. See CLAUDE.md's "Native firmware" section for the full
+ * history, including the earlier bounded/static-bring-up phase this
+ * grew out of.
  */
 
 #include "hardware/flash.h"
@@ -50,13 +47,27 @@
 #include <sharpdisp/sharpdisp.h>
 
 #include "hdw.h"
+#include "keyboard.h"
 #include "pins.h"
 #include "rom_syscalls.h"
 #include "saturn_lcd.h"
 
-/* Power of 10, Rule 2: same generous bring-up ceiling already proven
- * safe against this exact ROM by tests/saturn_smoke_test.c. */
-#define MAX_INSTR 2000000
+/* How often (in emulated instructions) the main loop checks for
+ * incoming key commands / considers a wall-clock redraw - see
+ * PollKeyboardInput() and the redraw block in main(). Not a real
+ * hardware quantity, just "often enough" relative to human reaction
+ * time given this core's real execution speed on this board. */
+#define INSTR_PER_POLL 200
+#define REDRAW_INTERVAL_MS 100
+
+/* See firmware/CMakeLists.txt's CASSINI_VERBOSE_BOOT_LOG option -
+ * deactivated (not removed) by default: the per-checkpoint LogLine()
+ * call below is real, useful debugging infrastructure, but each call
+ * does a real flash write and a full display refresh, and there are
+ * up to 100 of them in one MAX_INSTR run. */
+#ifndef CASSINI_VERBOSE_BOOT_LOG
+#define CASSINI_VERBOSE_BOOT_LOG 0
+#endif
 
 /* Real Saturn/HP48 hardware timer register control bits (hdw.t1_ctrl/
  * hdw.t2_ctrl - hdw.h:52-57) and the real T2-ticks-per-T1-tick ratio
@@ -262,6 +273,80 @@ static ChfAction BadOpcodeHandler( const ChfDescriptor* descriptor, const ChfSta
     return CHF_RESIGNAL;
 }
 
+/**
+ * @brief Wire protocol for tools/hp48_keyboard_gui.py: exactly 3 raw
+ * bytes per message, no framing byte or newline needed - 'P' or 'R',
+ * then 2 uppercase-hex-digit ASCII chars encoding the keycode
+ * saturn_core's own KeybPress()/KeybRelease() expect (see keyboard.h
+ * and emulator_api.c's keyboard48[] table, the reference this
+ * project's copy of the keymap - in the GUI, not duplicated here - was
+ * taken from, same "copy the reference values, don't include the
+ * file" posture saturn_lcd.c's LCD decode already established). Every
+ * real row/col keycode fits in one byte (max 0xBF); the one exception,
+ * the ON key's real code 0x8000, doesn't - the wire byte 0xFF is
+ * reserved to mean ON instead, translated back to 0x8000 below.
+ *
+ * A GUI mouse-down sends 'P' immediately; mouse-up sends 'R'
+ * immediately - no threshold/hold-detection protocol is needed here,
+ * unlike soynut's HP-41 key bridge: KeybPress()/KeybRelease() persist
+ * real state in the emulator's own keyboard matrix between calls, so
+ * the ROM's own keyboard scan sees a key as held for exactly as long
+ * as it takes the GUI to send the release, with no "sustain" plumbing
+ * required on this side.
+ *
+ * Power of 10, Rule 2/3: fixed 3-byte message, bounded number of bytes
+ * read per call (at most INSTR_PER_POLL-cadence calls' worth), and any
+ * unrecognized byte (wrong position, bad hex digit, mid-message 'P'/
+ * 'R') resyncs cleanly by discarding the in-progress message rather
+ * than misinterpreting partial input - same recovery posture soynut's
+ * own hp41_key_bridge.c established for its escape-sequence protocol.
+ */
+static void PollKeyboardInput( void )
+{
+    static char pending_cmd = 0; /* 'P', 'R', or 0 (no message in progress) */
+    static char pending_hex[ 2 ];
+    static int pending_hex_count = 0;
+
+    for ( int i = 0; i < 32; i++ ) { /* bounded work per call */
+        const int c = getchar_timeout_us( 0 );
+        if ( c == PICO_ERROR_TIMEOUT )
+            break;
+
+        if ( c == 'P' || c == 'R' ) {
+            pending_cmd = ( char )c;
+            pending_hex_count = 0;
+            continue;
+        }
+
+        if ( pending_cmd == 0 )
+            continue; /* stray byte outside any message - ignore */
+
+        const bool is_hex_digit = ( c >= '0' && c <= '9' ) || ( c >= 'A' && c <= 'F' );
+        if ( !is_hex_digit ) {
+            pending_cmd = 0; /* malformed - resync */
+            continue;
+        }
+
+        pending_hex[ pending_hex_count++ ] = ( char )c;
+        if ( pending_hex_count < 2 )
+            continue;
+
+        const int nibble0 = ( pending_hex[ 0 ] <= '9' ) ? pending_hex[ 0 ] - '0' : pending_hex[ 0 ] - 'A' + 10;
+        const int nibble1 = ( pending_hex[ 1 ] <= '9' ) ? pending_hex[ 1 ] - '0' : pending_hex[ 1 ] - 'A' + 10;
+        const int wire_byte = ( nibble0 << 4 ) | nibble1;
+        const int keycode = ( wire_byte == 0xFF ) ? 0x8000 : wire_byte;
+
+        if ( pending_cmd == 'P' )
+            KeybPress( keycode );
+        else
+            KeybRelease( keycode );
+        printf( "cassini: key %c 0x%04X\n", pending_cmd, keycode ); /* serial-only, see LogLine()'s own precedent */
+
+        pending_cmd = 0;
+        pending_hex_count = 0;
+    }
+}
+
 int main( void )
 {
     /* Both of these start before stdio_init_all()/the USB-serial wait
@@ -337,17 +422,29 @@ int main( void )
     LogLine( "loading ROM..." );
     EmulatorInit();
     assert( cpu.pc == 0 ); /* CpuReset()'s documented cold-start value */
-    LogLine( "ROM loaded, running up to %d instr", MAX_INSTR );
+    LogLine( "ROM loaded, entering interactive mode" );
 
-    /* volatile: modified after setjmp(), read after a possible
-     * longjmp() back into this frame from BadOpcodeHandler(). */
-    volatile int executed = 0;
+    bitmap_clear( &sd.bitmap ); /* erase the log before the first real render */
+    saturn_lcd_render( &sd );
+    sharpdisp_refresh( &sd );
+    printf( "cassini: display refreshed\n" ); /* serial-only - the log view is now replaced by the real render */
+
+    long executed = 0;
     int t1_subcount = 0; /* T2 ticks accumulated toward the next T1 tick */
+    absolute_time_t next_redraw = make_timeout_time_ms( REDRAW_INTERVAL_MS );
 
     if ( setjmp( bad_opcode_unwind ) == 0 ) {
         ChfPushHandler( CPU_CHF_MODULE_ID, BadOpcodeHandler, &bad_opcode_unwind, ( void* )NULL );
-        for ( ; executed < MAX_INSTR; executed++ ) {
+
+        /* Power of 10, Rule 2 deliberate exception - see DEVIATIONS.md.
+         * A real HP48SX runs until powered off; there is no meaningful
+         * instruction bound to apply once real keyboard interaction is
+         * in play (the earlier bounded static-bring-up harness this
+         * grew out of used MAX_INSTR precisely because it never
+         * accepted input and had to stop somewhere). */
+        while ( true ) {
             OneStep();
+            executed++;
 
             /* Drive the real Saturn T1/T2 timer registers - see the
              * T1_CTRL_.../T2_CTRL_.../T1_MULTIPLIER block above for
@@ -379,17 +476,29 @@ int main( void )
                 }
             }
 
+#if CASSINI_VERBOSE_BOOT_LOG
             if ( executed % 20000 == 0 )
-                LogLine( "...%d instr, pc=0x%05X", executed, cpu.pc );
+                printf( "cassini: ...%ld instr, pc=0x%05X\n", executed, cpu.pc );
+#endif
+
+            if ( executed % INSTR_PER_POLL == 0 ) {
+                PollKeyboardInput();
+
+                if ( time_reached( next_redraw ) ) {
+                    bitmap_clear( &sd.bitmap );
+                    saturn_lcd_render( &sd );
+                    sharpdisp_refresh( &sd );
+                    next_redraw = make_timeout_time_ms( REDRAW_INTERVAL_MS );
+                }
+            }
         }
     }
 
-    LogLine( "executed %d instr, pc=0x%05X%s", executed, cpu.pc, hit_bad_opcode ? " (bad opcode)" : "" );
-
-    bitmap_clear( &sd.bitmap ); /* erase the log before the real render */
-    saturn_lcd_render( &sd );
-    sharpdisp_refresh( &sd );
-    printf( "cassini: display refreshed\n" ); /* serial-only - the log view is now replaced by the real render */
+    /* Only reached via longjmp from BadOpcodeHandler() - a genuine
+     * failure, unlike normal operation above, so this one spot still
+     * uses LogLine() to put the error on screen (nothing more will be
+     * rendered after this point). */
+    LogLine( "hit bad opcode 0x%X at pc=0x%05X, halted", bad_opcode_code, cpu.pc );
 
     while ( true ) {
         sleep_ms( 1000 );

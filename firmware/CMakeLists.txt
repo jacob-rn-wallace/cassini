@@ -108,6 +108,19 @@ target_include_directories(cassini PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/stubs
 )
 
+# Off by default: main.c's instruction loop logs progress (on-screen +
+# flash-persisted) every 20000 of MAX_INSTR's 2,000,000 instructions -
+# ~100 calls, each doing a real flash_range_program() and a full SPI
+# display refresh. Genuinely useful while actively debugging (that's
+# exactly how the timer-driven-execution and PSRAM bugs were diagnosed
+# - see CLAUDE.md's "Native firmware" section), but it's real,
+# noticeable wall-clock cost on every single boot otherwise. Deactivated
+# by default rather than removed - flip back on for debugging.
+option(CASSINI_VERBOSE_BOOT_LOG "Log instruction-loop progress every 20000 instructions (slower boot)" OFF)
+if (CASSINI_VERBOSE_BOOT_LOG)
+    target_compile_definitions(cassini PRIVATE CASSINI_VERBOSE_BOOT_LOG=1)
+endif ()
+
 # serial.c calls read()/write()/close() without including <unistd.h>
 # itself (its original build must have picked those declarations up
 # transitively through some other header - not true against this

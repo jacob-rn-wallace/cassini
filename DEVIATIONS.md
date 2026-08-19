@@ -48,3 +48,30 @@ project doesn't get to choose, not a real correctness risk.
 **Boundary:** exactly that one `va_start` call. Nothing else in
 `chf_compat.c` or elsewhere suppresses `-Wvarargs`, `-Wpedantic`, or
 any other warning class.
+
+## `firmware/main.c` — unbounded main loop (Rule 2)
+
+**Rule affected:** Power of 10, Rule 2 (all loops must have a fixed
+upper bound).
+
+**What's excepted:** `main()`'s interactive execution loop
+(`while (true) { OneStep(); ... }`, after ROM load) has no instruction
+bound.
+
+**Why:** this is a real calculator replica meant to run until powered
+off, the same as soynut's own main loop - once real keyboard
+interaction (`PollKeyboardInput()`) is in play, there is no meaningful
+instruction count to bound it by; an artificial cap would just mean
+the calculator "runs out of instructions" and freezes mid-use. The
+earlier static-bring-up phase this grew out of *did* use a bounded
+loop (`MAX_INSTR`, since removed) precisely because it never accepted
+input and had to stop somewhere for that milestone's purposes - see
+`CLAUDE.md`'s "Native firmware" section for that history.
+
+**Boundary:** exactly that one loop. Every loop inside it
+(`PollKeyboardInput()`'s per-call byte-reading loop, the T1/T2 timer
+logic) stays genuinely bounded per iteration/call, and the loop is
+still escapable (a bad opcode still unwinds it via the existing
+`setjmp`/Chf-handler mechanism) - this exception is about the loop
+having no instruction *count* bound, not about it being unrecoverable
+or doing unbounded work per iteration.

@@ -124,7 +124,19 @@ because it never drove the real Saturn hardware timer registers
 `saturn_core` changes), and the physical display now shows real,
 legible HP48SX firmware UI (a genuine "Try to Recover Memory?" prompt)
 for the first time. See "Timer-driven execution" (also under "Native
-firmware" below) for that account.
+firmware" below) for that account. Immediately after that, again the
+same session: a real interactive keyboard bridge (`main.c`'s loop is
+now genuinely unbounded/continuous, a documented Rule 2 exception -
+see `DEVIATIONS.md`; a wire protocol over USB serial drives
+`saturn_core`'s own `KeybPress()`/`KeybRelease()`; a Tkinter GUI,
+`tools/hp48_keyboard_gui.py`, presents a real, gridded-and-verified
+clickable HP48GX keyboard photo). Confirmed working end to end for a
+neutral key and for the recovery prompt's NO answer (including this
+project's own bad-opcode safety net catching a real vendored-core
+opcode gap cleanly); YES reaches the same gap but doesn't get caught
+by that same safety net, left open as a real next-session
+investigation. See "Interactive keyboard bridge" (also under "Native
+firmware" below) for the full account.
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -186,8 +198,11 @@ Scaffolded per the project's bootstrap plan, mirroring soynut's layout:
   see "Native (host) tests" below.
 - **`sim/`** — will hold a host-native full simulator, later phase,
   mirroring soynut's `sim/`.
-- **`tools/`** — will hold native diagnostic tools plus a Tkinter
-  clickable-keyboard GUI, mirroring soynut's `tools/`.
+- **`tools/`** — `hp48_keyboard_gui.py`, a Tkinter clickable-keyboard
+  GUI modeled on soynut's own `tools/hp41_keyboard_gui.py`, driving the
+  firmware over USB serial. See "Native firmware" below's "Interactive
+  keyboard bridge" section for the full account. Native (non-Python)
+  diagnostic tools not yet started.
 - **`reference-material/`** — datasheets/mockups, not read by any build
   step. Gitignored (unlike soynut, where it's tracked) — pending a
   decision on what belongs here and whether any of it needs to be
@@ -915,14 +930,128 @@ plumbing, and `saturn_lcd.c`'s LCD decode (bit ordering, 3x scaling,
 softkey label positioning) all producing genuine, readable calculator
 output.
 
-**Deliberately not yet done — a real, separate next step:** actually
-answering the YES/NO prompt needs keyboard input, and there's no
-physical keyboard wired to this project yet (per "Native firmware"
-above's own stated scope, keyboard/real-time interactivity was always
-planned as a later phase, not part of this static bring-up milestone).
-The likely minimal first step, not yet started: two GPIO buttons wired
-to whatever `keyboard.c` expects for just those two softkeys, rather
-than a full keypad.
+Actually answering the YES/NO prompt needed keyboard input - see
+"Interactive keyboard bridge" immediately below for how that was built
+(a host-side virtual keyboard over USB serial, not physical GPIO
+buttons - the user's explicit direction once soynut's own equivalent
+tool was pointed to as the template).
+
+### Interactive keyboard bridge: `firmware/main.c` + `tools/hp48_keyboard_gui.py`, 2026-08-19
+
+Same day again, immediately following "Timer-driven execution" above.
+Modeled on soynut's own `tools/hp41_keyboard_gui.py` (a Tkinter
+clickable-keyboard photo GUI over USB serial) at the user's explicit
+direction, adapted for the real HP48SX/GX keyboard and this project's
+own keyboard-injection mechanism - not a straight copy, since the two
+projects' underlying key-delivery mechanisms turned out to be
+genuinely different (see below).
+
+**Real architecture change, not just an addition**: `firmware/main.c`
+previously ran a bounded 2,000,000-instruction loop once, then froze
+forever. Interactive use needs a genuinely continuous loop instead -
+`main()`'s instruction loop is now unbounded (`while (true) { ... }`),
+running until powered off like a real calculator. This is a
+deliberate, documented exception to Power of 10's Rule 2 (bounded
+loops) - see `DEVIATIONS.md`'s new entry for the full justification
+and boundary (only that one loop; everything nested inside it, e.g.
+`PollKeyboardInput()`'s per-call byte-reading, stays genuinely
+bounded). `MAX_INSTR` is gone; the loop now polls for incoming serial
+key commands and redraws the display on a wall-clock cadence
+(`REDRAW_INTERVAL_MS = 100`) instead of stopping and rendering once.
+
+**Keyboard-injection mechanism - researched directly from
+`saturn_core/src/core/keyboard.c` before writing any code**: the
+embedder API is exactly two functions, `KeybPress(int keycode)` and
+`KeybRelease(int keycode)` (`keyboard.h`). `keycode` packs a real
+HP48 keyboard-matrix row/column as `(OUT_bit << 4) | IN_bit`; the ON
+key is a special case (`0x8000`, sets/clears a bit across all OUT
+lines at once rather than a normal row/col code). Real HP48SX/GX
+keycodes for all 49 keys are copied directly from
+`saturn_core/src/emulator_api.c`'s `keyboard48[]` table (the vendored
+core's own reference embedder, itself never included by this
+project - the same "copy the reference values, don't include the
+file" posture `saturn_lcd.c`'s LCD decode already established).
+`KeybPress()` fires a real Saturn hardware NMI
+(`CpuIntRequest(INT_REQUEST_NMI)`); `KeybRelease()` posts nothing.
+Critically, **this turned out simpler than soynut's HP-41 equivalent**:
+`KeybPress()`/`KeybRelease()` persist real state directly in the
+emulator's own keyboard matrix between calls, so a key stays "held"
+for exactly as long as it takes to call `KeybRelease()` - no
+sustain/re-assert plumbing is needed the way soynut's
+`hp41_key_hold_bridge.c` needed for the HP-41's `dokey()` polling
+architecture, and no tap-vs-hold threshold-timing protocol is needed
+in the GUI either. A mouse-down sends a press immediately; a mouse-up
+sends a release immediately - full stop.
+
+**Wire protocol**, correspondingly simpler than soynut's: exactly 3
+raw bytes per message, `'P'`/`'R'` followed by 2 uppercase-hex-digit
+ASCII chars encoding the keycode. Every real row/col keycode fits in
+one byte (max `0xBF`); the wire byte `0xFF` is reserved to mean the ON
+key, since its real code (`0x8000`) doesn't fit. No newline or framing
+byte needed - `firmware/main.c`'s `PollKeyboardInput()` parses exactly
+3 bytes per message and resyncs cleanly on any unrecognized byte
+(Power of 10, Rule 2/3: bounded work per call, no misinterpreted
+partial input), the same recovery posture soynut's own
+`hp41_key_bridge.c` established for its own escape-sequence protocol.
+Keypress logging during interactive use uses plain `printf()` (serial-
+only), never `LogLine()` - `LogLine()`'s `LogRedraw()` unconditionally
+overwrites the physical panel with the debug log, which was exactly
+the point during boot but would otherwise clobber the real calculator
+UI on every single keypress once rendering has started.
+
+**`tools/hp48_keyboard_gui.py`'s `KEY_MAP` (49 real keys, not
+eyeballed)**: derived the same diligent way soynut's own image-based
+hit-boxes were - a gridded overlay of `HP48GXkeyboard.jpg` (50px minor
+gridlines, 200px major gridlines with coordinate labels burned in) was
+used to read every key's real edges directly off the photo, then every
+computed hit-box was rendered back onto the full photo and visually
+confirmed to land tightly on its own key with zero overlaps across all
+49 keys before being trusted. Two real column pitches were found and
+used: a tighter 280px pitch across the top 5 rows (the A-F softkeys
+through the ENTER row, 6 columns - ENTER itself spans the physical
+width of two columns), and a wider ~350px pitch across the bottom 4
+rows (the digit/operator block, 5 columns) - the same "more columns =
+tighter pitch" pattern soynut's own HP-41 photo showed, just with the
+tight/wide rows in the opposite order (HP48's tight block is on top;
+HP-41's was on the bottom).
+
+**`HP48GXkeyboard.jpg`'s license**: a photograph by Clemens Pfeiffer
+(uploaded by Panoramafotos.net) via Wikimedia Commons -
+<https://commons.wikimedia.org/wiki/File:HP48GX.jpg> - licensed CC
+BY-SA 3.0, confirmed directly from the Commons file page rather than
+assumed. Cropped to just the keyboard region by this project's own
+user before being added to the repo; redistributing it (or this repo)
+must keep this attribution and the CC BY-SA 3.0 license per its terms.
+
+**Verified working, with one real bug found and left open**:
+- A neutral key (N7, `0x33`) presses and releases cleanly, confirmed
+  via a real scripted serial test (not the GUI itself, which needs a
+  human to click) - `cassini: key P 0x0033` / `cassini: key R 0x0033`,
+  no adverse effects.
+- **NO** (`0x80`) on the "Try to Recover Memory?" prompt works
+  correctly end to end, including this project's own safety net: it
+  reaches a real bad opcode in the ROM's own memory-recovery code at
+  `PC=0x010E6` (a genuine gap in the vendored core's opcode coverage,
+  not something this project can fix without editing `saturn_core`),
+  and `BadOpcodeHandler`'s `ChfSignal`/`longjmp` unwind catches it
+  correctly on the very first hit - `"hit bad opcode 0x12D at
+  pc=0x010E6, halted"`, a clean, controlled stop.
+- **YES** (`0x14`) reaches the exact same `PC=0x010E6` address, but the
+  unwind does **not** engage - instead of stopping on the first hit,
+  execution keeps running through a long, exactly-repeating cycle of
+  bad-opcode errors (confirmed reproducible across multiple clean
+  reboots, same PC sequence every time) for as long as observed (a
+  fixed, several-second test window), never reaching the "halted"
+  message. The condition code matches `CPU_E_BAD_OPCODE` (301)
+  identically in both the YES and NO cases, so this isn't an obviously
+  different failure mode being hit - something about the real code
+  path YES's softkey dispatch takes causes this project's own
+  `ChfPushHandler`/`ChfSignal` safety net to stop engaging partway
+  through, not yet root-caused. **Left open, deliberately paused here
+  at the user's request** rather than continuing to dig blind - a real
+  next-session investigation, not a wire-protocol or architecture
+  problem (both of those are independently confirmed working via the
+  N7 and NO tests above).
 
 ## ROM images — bring your own
 
