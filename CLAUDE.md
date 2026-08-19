@@ -1064,6 +1064,150 @@ window with no errors.
   problem (both of those are independently confirmed working via the
   N7 and NO tests above).
 
+### YES-path bad-opcode investigation, 2026-08-19 - not yet root-caused
+
+Same day again. A real, deep root-cause investigation, not just more
+reproduction - real progress was made (several false leads found and
+correctly ruled out rather than assumed, two genuinely distinct
+failure modes discovered, one of them fully captured with real
+register-level state), but the actual root cause is still open,
+paused at the user's request rather than continuing to dig without the
+hardware debugging tools (a real SWD/GDB probe) this now likely needs.
+
+**Host reproduction never worked, and the reason why turned out to be
+the first real finding.** A standalone host-side repro tool
+(`/private/tmp/.../keypress_debug.c`, not committed - scratch, built
+against `tests/build/`'s object files the same way
+`tests/saturn_smoke_test.c` is) replicated `main.c`'s exact timer-tick
+logic, warmed up to a fixed 2,000,000 instructions (landing at
+`pc=0x0092C`, matching the *old*, since-removed bounded harness's own
+snapshot), then called `KeybPress(0x14)` - and swept both press-only
+and press+release timing (1 to 10,000 instructions apart) without ever
+reproducing a single bad opcode. **The flaw was the fixed 2,000,000
+warmup itself**: once real hardware CPU-state tracing was added (see
+below) and captured what `firmware/main.c` was actually doing right
+before a real keypress arrived, its `before-P` snapshot showed
+`pc=0x04930` - not `0x0092C`. The old bounded harness stopped at
+exactly 2,000,000 instructions; the new continuous one doesn't stop at
+all, so by the time a real USB keypress physically arrives (however
+many real seconds after boot), the CPU has run for an genuinely
+unpredictable number of instructions beyond that, cycling through
+different idle-loop phases. The host tool's fixed-instruction-count
+methodology was measuring a state that real hardware never actually
+occupies at keypress time - a real, instructive dead end, not the bug
+itself.
+
+**Real theories investigated and correctly ruled out, not assumed
+away:**
+- **Stale `tests/build/` objects** (predating `saturn_core.patch`) -
+  real, found, fixed (full rebuild), but not the cause of this bug.
+- **Periodic LCD-memory reads** (matching `main.c`'s real redraw
+  cadence) as a possible source of read-side-effects - added to the
+  host repro, no change.
+- **`char` signedness** - ARM EABI (`arm-none-eabi-gcc`, this
+  project's actual firmware target) defaults `char` to *unsigned*;
+  macOS clang (the host, where `tests/saturn_smoke_test.c` has always
+  passed cleanly) defaults it to *signed* - confirmed directly via
+  each compiler's own `__CHAR_UNSIGNED__` predefine, not assumed.
+  `Nibble` is `typedef char int4` (`types.h`), so this looked like a
+  strong, well-evidenced candidate. **Disproven by direct test**:
+  forcing `-funsigned-char` on a from-scratch host rebuild (matching
+  ARM's default) still could not reproduce the bug across the same
+  timing sweep. A real near-miss - a `-fsigned-char` fix was drafted
+  and then reverted once the validation test failed, rather than
+  shipped on the strength of the theory alone.
+- **Corrupted/duplicated wire-protocol delivery** from the host's own
+  flaky serial connection - checked directly against a real failure
+  log; exactly one clean `P`/`R` pair, no duplication.
+- **ROM content mismatch** between the raw `.rom` file used for host
+  testing and the array actually embedded in `roms/rom_images.c` -
+  MD5-verified byte-identical.
+- **Uninitialized-variable bugs**, checked for directly via a one-off
+  strict-warnings (`-Wall -Wextra -Wuninitialized -Wmaybe-uninitialized`)
+  compile of the relevant `saturn_core` files under the real ARM
+  toolchain - nothing surfaced.
+
+**Real hardware CPU-state tracing, built once host repro was
+understood to be unrepresentative** (all "TEMPORARY diagnostic" in
+`firmware/main.c`, kept in place rather than removed - see below for
+why): `DumpCpuState()` records `pc`/`p`/`hst`/carry/`int_enable`/
+`int_service`/`int_pending`/the full 8-entry return stack/both data
+pointers - not just PC - to a trace, callable cheaply and often enough
+to actually catch a divergence. Wired into `PollKeyboardInput()`
+(before/after every press and release) and the main loop (every 20
+instructions for 3,000 instructions after a keypress,
+`TRACE_STEP_INTERVAL`/`TRACE_LENGTH_INSTR`).
+
+**First tracing attempt wrote straight to flash (like the boot log) -
+and that choice itself made the bug stop reproducing.** Real
+`flash_range_erase()`/`flash_range_program()` calls take real
+wall-clock time; interleaving ~150 of them into the timing-sensitive
+window after a keypress shifted that same timing enough to dodge the
+race being investigated (0 reproductions across another full sweep,
+this time with the *fix* for the false char-signedness lead already
+reverted, so genuinely the tracing itself was the perturbation).
+**Reworked to trace into a plain heap buffer instead** (this project's
+heap is PSRAM-backed - see `CASSINI_PSRAM_HEAP` - so this costs a fast
+RAM write, no erase, no program-time delay) via `PsramTraceAppend()`
+into a 512 KiB circular buffer (`psram_trace`), with the *only* flash
+write deferred to `FlushTraceToFlash()` - called once, reactively,
+after the observation window has already fully elapsed
+(`trace_remaining` reaching 0), never interleaved with the
+timing-sensitive window itself.
+
+**This surfaced a second, genuinely distinct failure mode.** Repeated
+press/release attempts within a single boot session (sending several
+in a row, since single isolated attempts kept landing on lucky timing)
+did catch a real failure - but on that occasion `picotool`'s own
+force-BOOTSEL reset failed outright, and the flash log came back with
+only the original boot messages, meaning `FlushTraceToFlash()` never
+ran. This is different from the earlier-observed failure mode (a long,
+looping bad-opcode cascade where the main loop keeps running, main
+loop progress keeps advancing, and `FlushTraceToFlash()` fires
+normally at the end of the window) - this was a **true, total lockup**.
+
+**Added a watchdog to try to catch the true-lockup case too**:
+`main_loop_progress` (a `volatile long`, incremented once per main
+loop iteration) is watched by the existing `LedHeartbeat()` repeating-
+timer callback (already running independently, in an alarm IRQ
+context, once a second) - if it goes 2+ heartbeat ticks without
+changing, `LedHeartbeat()` itself calls `FlushTraceToFlash()` directly
+from IRQ context (flash operations are already interrupt-safe
+regardless of caller - both `flash_range_erase()`/`_program()`
+disable interrupts for their own duration). **This did not capture
+data either** - a repeated true-lockup reproduction still came back
+with only the original boot log, meaning even the independent hardware
+timer interrupt never got to run its stall-detection check.
+
+**Working conclusion, not yet confirmed**: since a hardware timer IRQ
+failing to fire at all - not just the main loop failing to progress -
+implies something is masking interrupts globally, not just occupying
+the main thread of execution, this strongly suggests a genuine ARM
+Cortex-M33 fault (a hard fault from an invalid memory/instruction
+access, most plausibly reached via the same corrupted execution the
+bad-opcode cascade already shows) with **no fault handler installed**
+- on this architecture, an unhandled fault typically raises execution
+priority to the point that ordinary interrupts (including this
+project's own LED-heartbeat timer) can't preempt it, matching exactly
+what was observed. The natural next diagnostic - installing a minimal
+`HardFault_Handler` that captures the fault status registers and PC
+directly, since fault handlers run at a priority high enough to still
+execute even when everything else is masked - was proposed and
+**deliberately not done, paused at the user's explicit request**
+rather than continuing without confirming this theory first.
+
+**Kept in place, not reverted, once the session paused**: the LED-
+heartbeat stall watchdog, `main_loop_progress`, the PSRAM trace buffer
+and its `DumpCpuState()`/`PsramTraceAppend()`/`FlushTraceToFlash()`
+machinery, and the `before-P`/`after-P`/`before-R`/`after-R`/`trc`
+call sites in `PollKeyboardInput()` and the main loop - all still
+marked `TEMPORARY diagnostic` in comments, but real, working
+infrastructure that took real effort to get right (especially the
+flash-timing-perturbation lesson) and will very likely be needed again
+for whatever comes next on this bug, the same "kept as a standing
+debug facility" precedent the flash-persisted boot log itself already
+established.
+
 ## ROM images — bring your own
 
 **The ROM files themselves are not in this repo, and never should be.**

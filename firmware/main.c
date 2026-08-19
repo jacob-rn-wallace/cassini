@@ -162,6 +162,7 @@ static void FlashLogFlush( void )
     restore_interrupts( ints );
 }
 
+
 /**
  * @brief Append one already-formatted line (plus a newline) to the
  * full in-RAM log buffer, then flush it to flash. Silently stops
@@ -181,6 +182,98 @@ static void FlashLogAppend( const char* line )
 
     FlashLogFlush();
 }
+
+/* TEMPORARY diagnostic - investigating the real-hardware-only YES/NO
+ * keyboard bug (see CLAUDE.md's "Native firmware" -> "Interactive
+ * keyboard bridge" section). Earlier attempt at this wrote each trace
+ * line straight to flash (like the boot log does) - real flash erase/
+ * program calls take real wall-clock time, which turned out to shift
+ * the very timing this bug is sensitive to, making it disappear
+ * whenever the tracing was detailed enough to be useful. This version
+ * traces into a plain heap buffer instead (this project's heap is
+ * PSRAM-backed - see CASSINI_PSRAM_HEAP - so this costs nothing but a
+ * fast RAM write, no erase, no program-time delay) and only touches
+ * flash once, reactively, via FlushTraceToFlash() below, well after
+ * the timing-sensitive window has already passed. */
+#define PSRAM_TRACE_SIZE ( 512 * 1024 )
+static char* psram_trace = NULL;
+static size_t psram_trace_pos = 0;
+
+static void PsramTraceAppend( const char* line )
+{
+    if ( psram_trace == NULL )
+        return;
+
+    const size_t len = strlen( line );
+    if ( psram_trace_pos + len + 1 >= PSRAM_TRACE_SIZE )
+        psram_trace_pos = 0; /* wrap - Power of 10, Rule 2: bounded, circular, never grows */
+
+    memcpy( psram_trace + psram_trace_pos, line, len );
+    psram_trace_pos += len;
+    psram_trace[ psram_trace_pos++ ] = '\n';
+
+    printf( "%s\n", line ); /* still cheap - only a flash-write would be the real cost here */
+}
+
+/* TEMPORARY diagnostic - the one place this trace actually touches
+ * flash: a single erase + program of the last (page-rounded) portion
+ * of psram_trace that fits FLASH_LOG_SIZE, reusing the same reserved
+ * region the boot log uses (this overwrites the boot log - acceptable
+ * here, the keypress trace is what matters once this fires). Called
+ * once, after the observation window has fully elapsed (see
+ * trace_remaining's own comment) - not interleaved with the trace
+ * itself, so it can't perturb the timing being investigated. */
+static void FlushTraceToFlash( void )
+{
+    if ( psram_trace == NULL || psram_trace_pos == 0 )
+        return;
+
+    size_t dump_len = psram_trace_pos;
+    if ( dump_len > FLASH_LOG_SIZE )
+        dump_len = FLASH_LOG_SIZE;
+    const size_t dump_start = psram_trace_pos - dump_len;
+
+    size_t program_len = ( dump_len + FLASH_PAGE_SIZE - 1 ) & ~( size_t )( FLASH_PAGE_SIZE - 1 );
+    if ( program_len > FLASH_LOG_SIZE )
+        program_len = FLASH_LOG_SIZE;
+
+    static char staging[ FLASH_LOG_SIZE ];
+    memset( staging, 0xFF, sizeof( staging ) );
+    memcpy( staging, psram_trace + dump_start, dump_len );
+
+    const uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase( FLASH_LOG_OFFSET, FLASH_LOG_SIZE );
+    flash_range_program( FLASH_LOG_OFFSET, ( const uint8_t* )staging, program_len );
+    restore_interrupts( ints );
+
+    printf( "cassini: trace flushed to flash (%u bytes)\n", ( unsigned )dump_len );
+}
+
+/* TEMPORARY diagnostic - dumps enough real Saturn CPU state (not just
+ * PC) to compare a real-hardware trace against an equivalent host
+ * trace nibble-for-nibble, to find the exact first point of divergence
+ * rather than continuing to guess at causes. */
+static void DumpCpuState( const char* label, long step )
+{
+    char line[ 160 ];
+    snprintf( line, sizeof( line ),
+              "%s s=%ld pc=%05X p=%X hst=%X cy=%d ie=%d is=%d ip=%d rp=%d "
+              "rs=%05X,%05X,%05X,%05X,%05X,%05X,%05X,%05X d=%05X,%05X",
+              label, step, ( unsigned )cpu.pc, ( unsigned )cpu.p, ( unsigned )cpu.hst, ( int )cpu.carry,
+              ( int )cpu.int_enable, ( int )cpu.int_service, ( int )cpu.int_pending, cpu.rstk_ptr,
+              ( unsigned )cpu.rstk[ 0 ], ( unsigned )cpu.rstk[ 1 ], ( unsigned )cpu.rstk[ 2 ], ( unsigned )cpu.rstk[ 3 ],
+              ( unsigned )cpu.rstk[ 4 ], ( unsigned )cpu.rstk[ 5 ], ( unsigned )cpu.rstk[ 6 ], ( unsigned )cpu.rstk[ 7 ],
+              ( unsigned )cpu.d[ 0 ], ( unsigned )cpu.d[ 1 ] );
+    PsramTraceAppend( line );
+}
+
+/* TEMPORARY diagnostic - PollKeyboardInput() sets this to start a
+ * bounded CPU-state trace right after processing a key command; the
+ * main loop below counts it down, one DumpCpuState() call every
+ * TRACE_STEP_INTERVAL instructions until it reaches 0. */
+static long trace_remaining = 0;
+#define TRACE_STEP_INTERVAL 20
+#define TRACE_LENGTH_INSTR  3000
 
 static jmp_buf bad_opcode_unwind;
 static bool hit_bad_opcode;
@@ -233,6 +326,16 @@ static void LogLine( const char* fmt, ... )
     LogRedraw();
 }
 
+/* TEMPORARY diagnostic - incremented once per main-loop iteration (see
+ * main()'s while(true) below); LedHeartbeat() watches this to detect a
+ * true hang (as opposed to a bad-opcode cascade that keeps the loop
+ * itself running - see CLAUDE.md's "Interactive keyboard bridge"
+ * section for why that distinction turned out to matter: a true hang
+ * never reaches FlushTraceToFlash()'s normal call site, since that
+ * only fires once the main loop's own trace window naturally elapses).
+ * volatile: written by main(), read by the timer ISR. */
+static volatile long main_loop_progress = 0;
+
 /**
  * @brief Repeating-timer callback toggling the onboard LED once a
  * second - a heartbeat independent of main()'s own progress. Runs in
@@ -242,6 +345,16 @@ static void LogLine( const char* fmt, ... )
  * the board is genuinely wedged (interrupts disabled or a stalled bus
  * access), not just slow - see CLAUDE.md's "Current blocker" section
  * for why that distinction matters here.
+ *
+ * TEMPORARY diagnostic addition: also watches main_loop_progress for a
+ * true hang and force-flushes whatever's in the PSRAM trace buffer to
+ * flash from right here, in IRQ context - the one case
+ * FlushTraceToFlash()'s normal call site (inside the main loop itself)
+ * can never reach, since a true hang means that loop never gets back
+ * around to it. Flash operations are safe to call from this context
+ * the same way they're safe anywhere else on this single-core
+ * target - flash_range_erase()/flash_range_program() already disable
+ * interrupts for their own duration regardless of caller.
  */
 static bool LedHeartbeat( struct repeating_timer* t )
 {
@@ -249,6 +362,22 @@ static bool LedHeartbeat( struct repeating_timer* t )
     static bool led_on = false;
     led_on = !led_on;
     gpio_put( PICO_DEFAULT_LED_PIN, led_on );
+
+    static long last_seen_progress = -1;
+    static int stall_ticks = 0;
+    static bool stall_flushed = false;
+    if ( main_loop_progress == last_seen_progress ) {
+        stall_ticks++;
+        if ( stall_ticks >= 2 && !stall_flushed ) {
+            stall_flushed = true;
+            FlushTraceToFlash();
+        }
+    } else {
+        last_seen_progress = main_loop_progress;
+        stall_ticks = 0;
+        stall_flushed = false;
+    }
+
     return true; /* keep repeating */
 }
 
@@ -337,10 +466,17 @@ static void PollKeyboardInput( void )
         const int keycode = ( wire_byte == 0xFF ) ? 0x8000 : wire_byte;
 
         if ( pending_cmd == 'P' )
+            psram_trace_pos = 0; /* TEMPORARY diagnostic - fresh trace per press, see PsramTraceAppend()'s comment */
+        DumpCpuState( pending_cmd == 'P' ? "before-P" : "before-R", 0 ); /* TEMPORARY diagnostic */
+
+        if ( pending_cmd == 'P' )
             KeybPress( keycode );
         else
             KeybRelease( keycode );
         printf( "cassini: key %c 0x%04X\n", pending_cmd, keycode ); /* serial-only, see LogLine()'s own precedent */
+
+        DumpCpuState( pending_cmd == 'P' ? "after-P" : "after-R", 0 ); /* TEMPORARY diagnostic */
+        trace_remaining = TRACE_LENGTH_INSTR;                          /* TEMPORARY diagnostic */
 
         pending_cmd = 0;
         pending_hex_count = 0;
@@ -407,6 +543,8 @@ int main( void )
      * because nothing forced psram.c's init code into the link). */
     LogLine( "psram: available=%d size=%u", ( int )psram_is_available(), ( unsigned )psram_get_size() );
 
+    psram_trace = malloc( PSRAM_TRACE_SIZE ); /* TEMPORARY diagnostic - see PsramTraceAppend()'s comment */
+
     ui4x_config.model = MODEL_48SX;
     ui4x_config.verbose = false;
 
@@ -445,6 +583,7 @@ int main( void )
         while ( true ) {
             OneStep();
             executed++;
+            main_loop_progress++; /* TEMPORARY diagnostic - see its own comment */
 
             /* Drive the real Saturn T1/T2 timer registers - see the
              * T1_CTRL_.../T2_CTRL_.../T1_MULTIPLIER block above for
@@ -489,6 +628,16 @@ int main( void )
                     saturn_lcd_render( &sd );
                     sharpdisp_refresh( &sd );
                     next_redraw = make_timeout_time_ms( REDRAW_INTERVAL_MS );
+                }
+            }
+
+            /* TEMPORARY diagnostic - see trace_remaining's comment. */
+            if ( trace_remaining > 0 && executed % TRACE_STEP_INTERVAL == 0 ) {
+                DumpCpuState( "trc", TRACE_LENGTH_INSTR - trace_remaining );
+                trace_remaining -= TRACE_STEP_INTERVAL;
+                if ( trace_remaining <= 0 ) {
+                    trace_remaining = 0;
+                    FlushTraceToFlash(); /* one-time, after the timing-sensitive window has passed */
                 }
             }
         }
