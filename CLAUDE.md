@@ -1386,6 +1386,127 @@ per this project's "vendored, never edited directly" rule - needs the
 same explicit approval the existing `N_PORT_2_BANK_48` patch got, not
 a unilateral decision.
 
+### SWD debug probe setup in progress, and a real ref_count design gap found by static reading, 2026-08-19
+
+Same day, resumed later in the session ("resume the hard-fault
+diagnostic" from earlier, then a follow-on "is there really no way to
+do it through GPIO?"/"let's do the soldering"/"I'm gonna go for
+ordering the cable" conversation). Two real threads, both still open:
+hardware debug-probe bring-up (in progress, blocked on a part in
+transit) and a genuine, precisely-characterized lead on the
+`USE_BUS_CACHE` corruption found by tracing the vendored cache code by
+hand while waiting.
+
+**Debug probe hardware, real progress, currently blocked on a part in
+transit - not this project's own hardware, the user's spare Pico 2.**
+Confirmed directly from real ARM/RP2350 facts (not assumed): SWCLK and
+SWDIO are dedicated silicon pins on the RP2040/RP2350 die, never routed
+to the GPIO fabric at all - true of every board in the family including
+the official Raspberry Pi Pico itself, so there is no GPIO-header-only
+path to SWD access on this or any Pico-family board, and switching the
+probe side to a spare Arduino Uno (considered and asked about directly)
+doesn't change that, since the limitation is entirely on the *target*
+side. Concretely done so far:
+- Flashed the user's spare Pico 2 with the official
+  `raspberrypi/debugprobe` firmware (`debugprobe_on_pico2.uf2`,
+  release `debugprobe-v2.3.1`, downloaded directly from GitHub
+  releases - default pin mapping confirmed straight from
+  `include/board_pico_config.h` in that repo: `GP2`=SWCLK, `GP3`=SWDIO,
+  `GP1`=target reset (optional), `GP4`/`GP5`=UART TX/RX bridge, any
+  GND). Flashed carefully with two RP-series boards connected
+  simultaneously (this project's own Pico Plus 2 plus the spare Pico
+  2) by targeting `picotool` explicitly by USB serial number
+  (`--ser`), confirming chip ID/flash size/package match the intended
+  board before writing, specifically to avoid any risk of
+  reflashing the wrong one.
+- Built `raspberrypi/openocd` (the RP2040/RP2350-maintained fork, not
+  mainline's older bundled Homebrew formula) from source into
+  `~/pico/openocd`, mirroring this project's existing "official
+  sources, machine-wide checkout" convention already used for
+  `pico-sdk`/`arm-gnu-toolchain` - configured with
+  `--enable-cmsis-dap --enable-cmsis-dap-v2 --enable-internal-jimtcl`,
+  builds clean, confirmed `tcl/target/rp2350.cfg` and
+  `tcl/interface/cmsis-dap.cfg` are present.
+- Physically located the Pico Plus 2's real debug connector from
+  photos the user sent (not guessed): a genuinely populated 3-pin
+  JST-SH connector, 1.0mm pitch, silkscreened `DEBUG`, on the *top*
+  side of the board, directly below a second, unrelated 4-pin
+  `QW/ST` (Qwiic/STEMMA QT) connector - **not** bare unpopulated pads
+  like the plain Pico 2 has, which is why the user didn't initially
+  recognize it. A second photo of the board's underside showed only an
+  unrelated `SP/CE` FFC connector (PSRAM/flash expansion), ruled out
+  directly rather than assumed irrelevant.
+- The user isn't equipped for 1.0mm-pitch freehand soldering (a real,
+  reasonable call - the failure mode of a bridged/lifted pad on the
+  board's only debug port is a real hardware-damage risk, not just an
+  inconvenience) and is instead ordering the official 3-pin JST-SH
+  1.0mm "Pico Debug" cable, in transit, expected next day. Confirmed
+  cable spec directly against Raspberry Pi's own Debug Probe
+  documentation for wire-color/pin order (SWCLK/GND/SWDIO) so the
+  wiring is ready to go the moment it arrives:
+  probe `GP2`->target `SWCLK`, probe `GP3`->target `SWDIO`, probe
+  GND->target GND (any of the probe's unblocked GND pins - this
+  session also mapped which physical pins on the user's specific spare
+  Pico 2 are reachable at all, since its micro breadboard is 3 pin-rows
+  short and physically blocks pins 18-23 - happily, none of the
+  debugprobe firmware's default pins fall in that range).
+
+**Real ref_count design gap found by hand-tracing the vendored cache
+code, while waiting on the cable - a real, specific lead, not yet
+proven.** Read through `bus_map__new()`, `bus_map__copy()`,
+`bus_map__replace()`, `cache__flush_except()`, `cache__config_get()`,
+`cache__unconfig_get()`, `cache__select_config_victim()`,
+`cache__check_for_late_hit()`, and `bus_map__free()` in full (`bus.c`,
+roughly lines 340-765), plus `bus_configure()`/`bus_unconfigure()`'s
+real call sites of all of the above (lines ~1054-1260) - the entire
+`USE_BUS_CACHE` subsystem the earlier HardFault investigation traced
+the crash into. `bus.h`'s own comment on `.cache.ref_count`
+(`bus.h:342-344`) states its documented, original-author intent
+plainly: **"This `.ref_count` is incremented by one when the
+`bus_map_t` is referenced by an unconfig link; it is used to avoid
+freeing referenced structures."** Confirmed by grep this is exactly
+and only what happens in the real code: `ref_count++` appears in
+precisely two places (`bus.c:1143` in `bus_configure()`, `bus.c:1251`
+in `bus_unconfigure()`'s late-hit path), both exclusively when a
+structure gets linked into some other node's `.cache.unconfig[]`
+array; it is never decremented anywhere in the file, and read/checked
+in exactly one place, `cache__select_config_victim()`
+(`bus.c:631`), as the *sole* safety gate before a cache slot is judged
+recyclable and handed to `bus_map__replace()`/`bus_map__copy()`, which
+overwrites that structure's entire contents in place.
+
+**The gap: nothing ever increments `ref_count` for a
+`.cache.config[]` forward reference** (another node's "if this tag
+comes up again, jump straight here" cache entry) **or for a structure
+simply being the live, active `bus_map_ptr`** - only the
+unconfig-chain backlink case is counted at all. In principle, a
+structure still meaningfully reachable through a config-cache forward
+link, but that has never happened to also pick up an unconfig-chain
+backlink, reads as `ref_count == 0` ("safe to recycle") to
+`cache__select_config_victim()`, which lines up exactly with the kind
+of corruption the HardFault investigation already captured: a
+`bus_map_t*` reachable via `.cache.unconfig[i]` in
+`cache__unconfig_get()` whose contents had been silently overwritten
+by something else entirely.
+
+**Explicitly not yet a proven root cause.** A careful attempt to trace
+the actual pointer-reachability graph the real code constructs (which
+nodes' `.config[]` tables can end up pointing at which other nodes,
+and under what call sequence) did not turn up an obviously-reachable
+concrete overwrite sequence through static reading alone within this
+session - every config-cache child looked, on inspection, to be
+uniquely owned by the single node that created it, and the one path
+that *does* let an existing structure become newly shared across
+nodes (`cache__check_for_late_hit()`, used by `bus_unconfigure()`'s
+late-hit path) already correctly increments `ref_count` when it does
+so. So the asymmetry in the design is real and precisely documented
+above, but whether it's actually *exploitable* given the true call
+sequence the ROM's YES-path softkey dispatch generates remains open -
+this needs either much more careful manual call-sequence modeling, or
+(more likely to actually resolve it) a live watchpoint on
+`ref_count`/`.cache.config[]` writes during a real YES-path run - a
+natural, concrete use for the SWD probe once wired up.
+
 ## ROM images — bring your own
 
 **The ROM files themselves are not in this repo, and never should be.**
