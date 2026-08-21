@@ -1,8 +1,157 @@
+diff --git a/src/core/bus.c b/src/core/bus.c
+index 5b92ab4..7cd1da4 100644
+--- a/src/core/bus.c
++++ b/src/core/bus.c
+@@ -141,7 +141,10 @@
+   ---------------------------------------------------------------------------*/
+ 
+ static const bus_t bus_hp48 = {
+-    {"ROM            (ROM)",  0x00, 0, RomInit48,  RomSave48,  RomRead48,  RomWrite48,  MODULE_CONFIGURED,      0x00000, 0xFFFFF, 0},
++    /* 2026-08-21, Cassini patch: r_size shrunk from 0xFFFFF to 0x7FFFF
++       to match N_ROM_SIZE_48's own HP48SX-specific reduction (bus.h) -
++       must move together, see that comment for the full picture. */
++    {"ROM            (ROM)",  0x00, 0, RomInit48,  RomSave48,  RomRead48,  RomWrite48,  MODULE_CONFIGURED,      0x00000, 0x7FFFF, 0},
+     {"Hardware Regs. (HDW)",  0x19, 5, hdw_init,   hdw_save,   hdw_read,   hdw_write,   MODULE_SIZE_CONFIGURED, 0x00000, 0x00040, 0},
+     {"Internal RAM   (RAM)",  0x03, 4, RamInit48,  RamSave48,  RamRead48,  RamWrite48,  MODULE_UNCONFIGURED,    0,       0,       0},
+     {"Bank Select    (CE1)",  0x05, 2, Ce1Init48,  Ce1Save48,  Ce1Read48,  Ce1Write48,  MODULE_UNCONFIGURED,    0,       0,       0},
+@@ -360,6 +363,32 @@ static bus_map_t* cache__clear_info_of( bus_map_t* d )
+     return d;
+ }
+ 
++/* 2026-08-21, Cassini patch: pairs with the two .cache.ref_count++
++   sites (bus_configure(), bus_unconfigure()'s late-hit path) - neither
++   of which was ever paired with a decrement anywhere in this file
++   (confirmed by exhaustive grep). Call this ONLY when `d`'s own
++   .cache.unconfig[] array holds `d`'s own genuine, previously-real
++   backlinks that are about to be discarded/overwritten - i.e. from
++   cache__flush_except() (on `save`, before its own
++   cache__clear_info_of() call) and from bus_map__replace()'s
++   "recycle existing struct" branch (on *d, BEFORE bus_map__copy()
++   overwrites it with `*d = *s`). Deliberately NOT called from
++   bus_map__copy()'s other two call sites (bus_map__replace()'s
++   "allocate new" branch, and bus_unconfigure()'s temp-clone creation)
++   or from bus_init()'s fresh cache__clear_info_of() call: in the
++   fresh-allocation case the pre-copy content is uninitialized
++   malloc() garbage (must never be dereferenced), and in the copy-into-
++   fresh-struct case `*d = *s` has just duplicated `s`'s own still-
++   valid entries into `d` - decrementing there would double-count
++   against a reference that legitimately still exists via `s`. */
++static void cache__release_unconfig_refs( bus_map_t* d )
++{
++    for ( int i = 0; i < N_BUS_SIZE; i++ )
++        if ( d->cache.unconfig[ i ] != ( bus_map_t* )NULL )
++            d->cache.unconfig[ i ]->cache.ref_count--;
++}
++
++
+ /* .+
+ 
+ .creation     : 15-Sep-2000
+@@ -471,8 +500,19 @@ static void bus_map__replace( bus_map_t** d, const bus_map_t* s )
+     if ( *d == ( bus_map_t* )NULL )
+         /* Allocation needed; cache cleared after allocation */
+         *d = bus_map__copy( bus_map__new(), s );
+-    else
++    else {
++        /* 2026-08-21, Cassini patch: *d is an existing, recycled
++           struct about to be overwritten by bus_map__copy() (which
++           calls cache__clear_info_of(), wiping *d's own
++           .cache.unconfig[] array) - release *d's own real backlinks
++           first, before that content is gone. Must happen here, not
++           inside bus_map__copy()/cache__clear_info_of() themselves,
++           since those are also called on freshly-allocated structs
++           whose pre-copy content must never be dereferenced this way -
++           see cache__release_unconfig_refs()'s own comment. */
++        cache__release_unconfig_refs( *d );
+         bus_map__copy( *d, s );
++    }
+ }
+ 
+ /* .+
+@@ -506,7 +546,14 @@ static void cache__flush_except( bus_map_t* save )
+     while ( p != ( bus_map_t* )NULL ) {
+         n = p->cache.link;
+ 
+-        if ( p != save )
++        /* 2026-08-21, Cassini patch: .cache.ref_count's own doc
++           comment (bus.h) says it exists "to avoid freeing referenced
++           structures" - this call was freeing them anyway. Now safe
++           to gate on it, since cache__release_unconfig_refs() (added
++           this same patch) keeps ref_count actually decrementing back
++           toward 0 as real backlinks go away, instead of only ever
++           growing. */
++        if ( p != save && p->cache.ref_count == 0 )
+             free( p );
+ 
+         p = n;
+@@ -516,6 +563,11 @@ static void cache__flush_except( bus_map_t* save )
+     save->cache.link = ( bus_map_t* )NULL;
+     cache_head = save;
+ 
++    /* 2026-08-21, Cassini patch: release save's own real backlinks
++       before wiping them below - see cache__release_unconfig_refs()'s
++       own comment for why this is the correct place to do it. */
++    cache__release_unconfig_refs( save );
++
+     /* Clear the caching information in 'save' */
+     cache__clear_info_of( save );
+ }
+@@ -1135,6 +1187,13 @@ void bus_configure( Address config_info )
+     }
+ 
+ #ifdef USE_BUS_CACHE
++    /* 2026-08-21, Cassini patch: this slot can already hold a real
++       backlink from an earlier visit to this same (cache-hit-
++       reactivated) struct - release it before overwriting, or its
++       target's ref_count would never come back down. */
++    if ( BUS_MAP.cache.unconfig[ mod ] != ( bus_map_t* )NULL )
++        BUS_MAP.cache.unconfig[ mod ]->cache.ref_count--;
++
+     /* Set the unconfig cache pointer of module 'mod' to the old BusMap,
+        and increment its reference counter, to avoid freeing it
+        improperly.
+@@ -1244,6 +1303,14 @@ void bus_unconfigure( Address unconfig_info )
+ #ifdef USE_BUS_CACHE
+     nxt = cache__check_for_late_hit();
+     if ( nxt != ( bus_map_t* )NULL ) {
++        /* 2026-08-21, Cassini patch: same reasoning as bus_configure()'s
++           equivalent overwrite above - release whatever this slot
++           already pointed to (cache__unconfig_get() found no
++           config_point hit for it, but the raw slot may still have
++           been non-NULL) before overwriting it. */
++        if ( old->cache.unconfig[ mod ] != ( bus_map_t* )NULL )
++            old->cache.unconfig[ mod ]->cache.ref_count--;
++
+         /* Update pointer from the old map to the new one, and increment
+            reference counter of the referenced structure
+         */
 diff --git a/src/core/bus.h b/src/core/bus.h
-index 4aa625b..c75a9d9 100644
+index 4aa625b..823dcfb 100644
 --- a/src/core/bus.h
 +++ b/src/core/bus.h
-@@ -191,7 +191,7 @@ typedef enum {
+@@ -180,7 +180,20 @@ typedef enum {
+ #  define N_BUS_SIZE 6
+ #  define N_PAGE_TABLE_ENTRIES 16384
+ 
+-#  define N_ROM_SIZE_48 512 * 1024 * 2
++/* 2026-08-21, Cassini patch: right-sized for this project's confirmed,
++   exclusive target (HP48SX) - was hardcoded to the larger HP48GX size
++   regardless of which model actually runs, wasting 512 KiB of the
++   struct BusStatus_48 malloc(). Paired with the matching /2 removal
++   in romram48.c's RomInit48() and the r_size shrink in bus.c's
++   bus_hp48[] ROM module table entry (0xFFFFF -> 0x7FFFF, preserving
++   the exact same "N_ROM_SIZE_48 - 1" relationship the original value
++   already had) - all three must move together, or the ROM module's
++   reset-time address window (bus.c) would stay sized for the old,
++   larger buffer while the buffer itself (this constant) shrinks,
++   opening a real out-of-bounds read window during the brief
++   cold-reset-to-self-configure gap. Scoped to HP48SX only - revert
++   this whole patch before ever targeting HP48GX. */
++#  define N_ROM_SIZE_48 256 * 1024 * 2
+ #  define N_RAM_SIZE_48 128 * 1024 * 2
+ /* 2.4: Port_1 (CE2) size */
+ #  define N_PORT_1_SIZE_48 128 * 1024 * 2
+@@ -191,7 +204,7 @@ typedef enum {
     The default value is 8, that is, Port_2 is emulated and its size is 1Mbyte.
   */
  // #define N_PORT_2_BANK_48 ( config.model == MODEL_48GX ? 32 : 1 )
@@ -11,3 +160,22 @@ index 4aa625b..c75a9d9 100644
  /* 2.4: Port_2 (NCE3) size */
  #  define N_PORT_2_SIZE_48 N_PORT_2_BANK_48 * 128 * 1024 * 2
  
+diff --git a/src/core/romram48.c b/src/core/romram48.c
+index 957b1e6..667c310 100644
+--- a/src/core/romram48.c
++++ b/src/core/romram48.c
+@@ -124,8 +124,12 @@ void RomInit48( void )
+     if ( ui4x_config.model == MODEL_48GX )
+         err = bus_read_nibblesFromFile( ui4x_make_filename_absolute_for_loading( ROM_FILE_NAME ), N_ROM_SIZE_48, bus_status_48->rom );
+     if ( ui4x_config.model == MODEL_48SX )
+-        // To load 48SX ROM, try again with half the size this time.
+-        err = bus_read_nibblesFromFile( ui4x_make_filename_absolute_for_loading( ROM_FILE_NAME ), N_ROM_SIZE_48 / 2, bus_status_48->rom );
++        /* 2026-08-21, Cassini patch: N_ROM_SIZE_48 (bus.h) is now
++           already the HP48SX-sized value, not the HP48GX one - the
++           original "/2" here would now under-read by half. See
++           bus.h's own comment on N_ROM_SIZE_48 for the full picture
++           (three locations move together). */
++        err = bus_read_nibblesFromFile( ui4x_make_filename_absolute_for_loading( ROM_FILE_NAME ), N_ROM_SIZE_48, bus_status_48->rom );
+     if ( err )
+         FATAL0( BUS_CHF_MODULE_ID, BUS_F_ROM_INIT )
+ }

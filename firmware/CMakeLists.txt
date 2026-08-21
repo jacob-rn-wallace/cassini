@@ -39,20 +39,19 @@ set(LIBCHF_DIR ${CMAKE_CURRENT_LIST_DIR}/../saturn_core/src/libChf/src)
 set(SATURN_COMPAT_DIR ${CMAKE_CURRENT_LIST_DIR}/saturn_compat)
 set(ROMS_DIR ${CMAKE_CURRENT_LIST_DIR}/../roms)
 
-# First (and so far only) edit to the vendored saturn_core - see
-# CLAUDE.md's "Current blocker" section for the full rationale.
-# N_PORT_2_BANK_48 (saturn_core/src/core/bus.h) is hardcoded to 32
-# (an 8 MiB Port_2/NCE3 card-slot buffer) for every HP48-series model,
-# even though HP48SX - this project's actual target - doesn't have
-# that card slot in real hardware at all. That single constant pushes
-# struct BusStatus_48's one malloc() call to ~9.5 MiB, too big even
-# for the Pico Plus 2's 8 MiB PSRAM heap (see CASSINI_PSRAM_HEAP
-# below). Applied as a maintained patch (../saturn_core.patch, tracked
-# in this repo) rather than hand-editing the submodule's checked-out
-# files, so `git submodule update --init` still reproduces the exact
-# pinned upstream commit - the patch is the only thing this repo
-# actually commits. Checked with --reverse --check first so this is
-# idempotent across repeated cmake reconfigures.
+# Edits to the vendored saturn_core - see CLAUDE.md's "Native firmware"
+# section for the full rationale behind each hunk in
+# ../saturn_core.patch (currently: N_PORT_2_BANK_48, right-sizing an
+# oversized Port_2/NCE3 card-slot buffer this project's HP48SX target
+# doesn't have in real hardware; the cache__flush_except()/ref_count
+# use-after-free fix; and N_ROM_SIZE_48, right-sizing the ROM buffer
+# for HP48SX specifically). Applied as a maintained patch
+# (../saturn_core.patch, tracked in this repo) rather than
+# hand-editing the submodule's checked-out files, so
+# `git submodule update --init` still reproduces the exact pinned
+# upstream commit - the patch is the only thing this repo actually
+# commits. Checked with --reverse --check first so this is idempotent
+# across repeated cmake reconfigures.
 execute_process(
         COMMAND git apply --reverse --check ${CMAKE_CURRENT_LIST_DIR}/../saturn_core.patch
         WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/../saturn_core

@@ -134,24 +134,36 @@ clickable HP48GX keyboard photo). Confirmed working end to end for a
 neutral key and for the recovery prompt's NO answer (including this
 project's own bad-opcode safety net catching a real vendored-core
 opcode gap cleanly); YES reaches the same gap but doesn't get caught
-by that same safety net. **Root-caused as of 2026-08-21**, once a
-working SWD debug probe made live reproduction possible: a real bug in
-the vendored core's `USE_BUS_CACHE` logic
-(`saturn_core/src/core/bus.c`'s `cache__flush_except()` frees cached
-`bus_map_t` structures without checking their own `ref_count` field,
-despite that field's whole documented purpose being to prevent exactly
-that) — confirmed live via a hardware watchpoint reproduction, not
-just static reading. **One candidate fix (gate the `free()` on
-`ref_count`) was tried the same day and reverted the same day** — it
-caused a worse, faster-onset regression (unbounded PSRAM heap growth
-past the physical 8 MiB chip, within seconds of boot, since
-`ref_count` is never decremented anywhere in the vendored core) rather
-than actually fixing anything. Reverted; back to the known-good
-baseline, bug still present. Still not fixed — this is vendored code,
-so any real fix needs the same explicit approval the project's one
-existing `saturn_core.patch` got.
-See "SWD bring-up completed, and the real root cause found" (also
-under "Native firmware" below) for the full account.
+by that same safety net. **Root-caused and fixed as of 2026-08-21**,
+once a working SWD debug probe made live reproduction possible: a real
+bug in the vendored core's `USE_BUS_CACHE` logic
+(`saturn_core/src/core/bus.c`'s `cache__flush_except()` was freeing
+cached `bus_map_t` structures without checking their own `ref_count`
+field, despite that field's whole documented purpose being to prevent
+exactly that) — confirmed live via a hardware watchpoint reproduction,
+not just static reading. A first fix attempt (gate the `free()` on
+`ref_count` alone) was tried and reverted the same day — `ref_count`
+is never decremented anywhere in the vendored core, so it caused a
+worse, faster-onset regression (unbounded PSRAM heap growth past the
+physical 8 MiB chip within seconds of boot) instead of actually fixing
+anything. **A second, complete fix — adding the missing decrement
+logic at the two semantically-correct release points, plus two
+narrower single-slot guards — was implemented, validated on the host
+across 63 million instructions and six real keypresses (bounded,
+stable memory), and confirmed working on real hardware** the same
+day: sustained multi-hundred-million-iteration execution, a real
+YES→NO→N7→YES keypress sequence processed with no bad opcode and no
+crash, correct display behavior verified via direct LCD-memory
+probing. Closing the resulting PSRAM budget gap needed two further,
+carefully-verified changes — `firmware/main.c`'s `PSRAM_TRACE_SIZE`
+shrunk to match its real flash capacity (zero functional loss), and a
+three-location `N_ROM_SIZE_48` right-sizing for this project's
+HP48SX-only target (a second `saturn_core.patch` hunk, on top of the
+pre-existing `N_PORT_2_BANK_48` one). See "Option 3 implemented,
+host-validated, and confirmed working on real hardware" (also under
+"Native firmware" below) for the full account, including a real GDB-
+tooling false alarm (`detach` not reliably resuming the target) that
+looked exactly like a firmware hang until traced to its actual cause.
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -1881,6 +1893,226 @@ only one of the three that can work at all**, since it's the only one
 that keeps genuinely-dead structures reclaimable. Left open for a
 future session, deliberately not attempted today given how quickly
 option 1's simpler version already went wrong.
+
+### Option 3 implemented, host-validated, and confirmed working on real hardware, same day
+
+Same 2026-08-21 session, resumed once more after the reverted fix
+above. Implements the "actually decrement `ref_count`" option this
+write-up's own candidate-fix list had flagged as "the only one of the
+three that can work at all" - and, unlike fix attempt #1, this one
+was proven safe *before* ever touching physical hardware again, using
+a purpose-built host-side validation harness. Confirmed working live
+afterward, including surviving a real, previously-confusing false
+alarm that turned out to be this session's own tooling, not the
+firmware.
+
+**The design, reasoned through completely before writing any code.**
+A correct decrement needs to fire at every place a `.cache.unconfig[]`
+back-reference gets overwritten or bulk-cleared - but `bus.c`'s
+`cache__clear_info_of()` is reused across genuinely different
+semantic contexts, and naively decrementing inside it would be wrong
+in two of its three call sites:
+- `bus_map__copy()`'s two "fresh/temp struct" call sites
+  (`bus_map__replace()`'s "allocate new" branch, and
+  `bus_unconfigure()`'s temp-clone creation) - by the time
+  `cache__clear_info_of()` runs there, the destination's cache fields
+  hold either uninitialized `malloc()` garbage (must never be
+  dereferenced) or a transient duplicate of the *source*'s still-valid
+  entries (copied via `*d = *s`) - decrementing either would either
+  crash or double-count against a reference that still legitimately
+  exists via the source.
+- `bus_init()`'s fresh-allocation call - same "uninitialized garbage"
+  hazard.
+
+Only two call sites are semantically correct places to release a
+struct's *own* real backlinks: `bus_map__replace()`'s "recycle
+existing struct" branch (release `*d`'s own entries **before**
+`bus_map__copy()` overwrites them), and `cache__flush_except()`
+(release `save`'s own entries before its own `cache__clear_info_of()`
+call). A new helper, `cache__release_unconfig_refs()`, is called only
+at those two sites - never inside `cache__clear_info_of()` itself,
+which stays completely unmodified. Two more sites needed a narrower,
+inline decrement: `bus_configure()` and `bus_unconfigure()`'s
+late-hit path both do a single-slot `.cache.unconfig[mod] = X`
+overwrite that can already hold a real prior value (if the struct was
+previously active and revisited via a cache hit) - each gets a
+"release the old value first, if any" guard immediately before the
+overwrite. `cache__flush_except()`'s `free()` call is re-gated on
+`ref_count == 0` (attempt #1's core idea, now actually safe since
+`ref_count` genuinely comes back down).
+
+**Host-side validation, built specifically to catch what attempt #1
+couldn't have caught this way.** A scratch harness
+(not committed - `/private/tmp/.../yes_path_test.c`, built against
+`tests/build/`'s object files the same way earlier scratch tools in
+this investigation were) replicates `firmware/main.c`'s real T1/T2
+timer-tick logic (without it the CPU just idles waiting for a timer
+interrupt the plain `tests/saturn_smoke_test.c` harness never drives)
+and injects real `KeybPress()`/`KeybRelease()` calls at fixed
+instruction counts, mirroring the real USB-serial wire protocol
+`main.c`/`tools/hp48_keyboard_gui.py` use. Ran a 3,000,000-instruction
+boot warmup followed by six real keypresses (YES, YES, NO, YES, N7,
+YES) spread across 63,000,000 total instructions - `PASS`, no bad
+opcode. A temporary counter (`g_diag_live_bus_map_count`, incremented/
+decremented at every real `bus_map__new()`/`free()`, printed on every
+`cache__flush_except()` call) showed the live node count climbing to
+26 during boot alone, then staying **exactly flat at 26** across all
+61,000,000 subsequent instructions and all six keypresses - real,
+confirmed bounded growth, a direct contrast with attempt #1's
+runaway-past-the-physical-chip behavior. (A first version of this
+same test gave an apparently-contradictory 4-vs-26 result between two
+runs; traced to stdio buffering interleaving `stdout`/`stderr`
+misleadingly when piped through `grep` - fixed with `setvbuf(...,
+_IONBF, ...)` on both streams, after which both runs agreed. Kept as
+a real methodological note: never trust interleaved buffered/
+unbuffered stream ordering under indirection without checking.)
+
+**A real capacity problem surfaced by that same validation, entirely
+separate from the correctness question.** 26 live `bus_map_t`
+structs, each carrying a full `N_PAGE_TABLE_ENTRIES` (16384) page
+table, is ~256 KiB apiece on the real ARM/PSRAM build (confirmed by
+matching the live-hardware address-delta observation from the
+watchpoint reproduction earlier this session, 262232 bytes, against a
+hand-computed estimate from `bus_page_table_entry_t`'s two function
+pointers shrinking from 8 bytes/pointer on the 64-bit host build to 4
+bytes/pointer on 32-bit ARM - the two independently-derived numbers
+matched to within 184 bytes). 26 × ~262232 bytes ≈ 6.5 MiB, which,
+added to `BusStatus_48`'s existing ~1.75 MiB and the 512 KiB
+`psram_trace` diagnostic buffer, totaled **~8.75 MiB against the
+physical 8 MiB PSRAM chip (109%)** - logically correct, boundedly
+sized, but still too big to actually fit. `N_BUS_CACHE_ENTRIES` was
+tested as a possible lever (reduced to 2, host-revalidated) and had
+**zero effect** on the 26-node count - a clean negative result,
+confirming the count reflects genuinely distinct configurations this
+ROM's boot sequence visits, not an eviction-policy inefficiency.
+`EmulatorInit()` was also confirmed (direct read of `emulator.c`) to
+call `bus_reset()` exactly once, ruling out a redundant-reset-cascade
+explanation too.
+
+**Two changes closed the gap, agreed with the user rather than
+picked unilaterally given the physical-hardware stakes:**
+1. **`firmware/main.c`: `PSRAM_TRACE_SIZE` shrunk from 512 KiB to
+   `FLASH_LOG_SIZE` (64 KiB)**, zero functional loss -
+   `FlushTraceToFlash()` already clamps to `FLASH_LOG_SIZE` when
+   persisting, so anything beyond the last 64 KiB of the old 512 KiB
+   circular buffer was already unreachable. A full removal was
+   considered and rejected as unnecessary churn - the buffer still
+   backs `HardFaultHandlerC`'s real, valuable no-probe-needed fault
+   capture.
+2. **A second `saturn_core.patch` hunk, right-sizing `N_ROM_SIZE_48`
+   for this project's confirmed, exclusive HP48SX target** (was
+   hardcoded to the larger HP48GX size regardless of active model,
+   already flagged in passing by this project's own prior research).
+   Turned out to need **three coordinated locations, not two** -
+   found by careful reading before implementing, not assumed: bus.h's
+   constant; `romram48.c`'s `RomInit48()`, which for `MODEL_48SX` was
+   dividing by 2 assuming the *old*, larger constant (removed, now a
+   plain `FATAL`-caught direct read); and, found only by tracing
+   `RomRead48()`'s completely unbounded `bus_status_48->rom[
+   rel_address ]` access back to its address-space source, a
+   **separate, hardcoded `0xFFFFF` literal** in `bus.c`'s
+   `bus_hp48[]` module table (`ROM`'s `r_size` field - the module's
+   address-window size *after a bus reset*, independent of
+   `N_ROM_SIZE_48`, real reset-time-full-address-space Saturn
+   architecture, not a bug). Shrinking the buffer alone, without also
+   narrowing this window, would have reopened a real out-of-bounds
+   read during the brief cold-reset-to-self-configure gap - caught by
+   reading `RomRead48()`'s and the module table's real code before
+   implementing, not discovered by a crash. Fixed to `0x7FFFF`,
+   preserving the exact same `N_ROM_SIZE_48 - 1` relationship the
+   original `0xFFFFF` already had. All three locations carry matching
+   dated comments cross-referencing each other. Explicitly scoped to
+   HP48SX only - would need reverting before ever targeting HP48GX.
+
+Final budget: `BusStatus_48` 1.25 MiB + `psram_trace` 0.06 MiB + 26
+nodes × ~262232 bytes ≈ 6.50 MiB = **7.82 MiB / 8 MiB (97.7%)** -
+under budget, ~185 KiB margin. Re-ran the full host validation
+(63,000,000 instructions, six keypresses) with all three
+`saturn_core.patch` hunks plus the `PSRAM_TRACE_SIZE` change together
+- identical `PASS`, identical stable 26-node count, ROM still loads
+correctly into the smaller buffer (no `BUS_F_ROM_INIT`). The
+temporary `g_diag_live_bus_map_count`/`fprintf` instrumentation was
+then fully removed from `bus.c` before finalizing - confirmed by grep
+and a clean rebuild - it was never meant to ship.
+
+**Confirmed working on real hardware** - flashed directly over SWD
+(`program ... verify reset exit`) the same way as before. First
+post-flash attempt showed the same `clearing lockup after double
+fault` OpenOCD message attempt #1's flash had shown - reproduced
+identically on a *correct*, working build, confirming this really is
+a flash-then-immediate-reset SWD/reset-sequence artifact (as
+suspected then), not evidence of any real firmware fault; a plain
+`monitor reset halt` cleared it exactly as before. A real,
+volatile `main_loop_progress` counter (already present from the
+2026-08-19 hard-fault investigation's stall watchdog) gave an
+unambiguous, sampling-bias-free forward-progress signal, unlike PC-
+based observation - critical, because it caught and then fully
+resolved a real, initially-alarming false alarm:
+
+**False alarm, fully root-caused: not a firmware bug, this session's
+own GDB tooling.** Two independent `main_loop_progress` reads five
+seconds apart returned the *identical* value, both right after a
+completely clean power cycle (ruling out residual state from earlier
+SWD probing) - strong, direct evidence of a real hang, consistent
+with (but at a different specific PC than) the `spi_write_blocking`
+freeze attempt #1's PSRAM overrun had caused, except this time
+`bus_map_ptr` (`0x11791448`) was safely inside the valid 8 MiB PSRAM
+window, ruling out that exact mechanism. Cross-checked directly via
+OpenOCD's own telnet interface (port 4444, independent of GDB) -
+`rp2350.cm0 curstate` reported **`halted`**, not running. Root cause:
+this batch-mode GDB harness's `detach` command was not reliably
+resuming the target with this specific OpenOCD/CMSIS-DAP setup (each
+`target extended-remote` connect halts the core to read state, as
+expected/needed - but the intended-to-resume `detach` at script end
+wasn't taking effect the way it does under normal interactive GDB).
+Every one of this session's post-flash "hang" observations was
+therefore reading back a state *this session's own scripts had
+frozen*, not a live firmware fault - confirmed decisively by manually
+issuing OpenOCD's own top-level `resume` command via telnet
+(`(echo "targets rp2350.cm0"; echo "resume"; echo "exit") | nc
+localhost 4444`) and immediately observing `main_loop_progress` jump
+by millions over the following several seconds. Switched to this
+telnet-`resume` discipline for every subsequent check this session -
+confirmed genuine, sustained execution (`main_loop_progress` climbing
+from ~5.3M through 13M, 28M, 40M, 81M, to 128M+ across repeated
+checks), and confirmed clean, error-free processing of a real YES→NO→
+N7→YES USB-serial keypress sequence (full serial capture, 147 KB,
+zero `ERROR`/`Bad opcode` occurrences - an earlier, single truncated
+4000-byte read had shown a false-positive `Bad opcode` match, traced
+to stale buffered content from an earlier, unrelated read, resolved
+by draining the port completely before checking).
+
+**One more real ambiguity resolved cleanly, the same
+already-established way.** After the YES→NO→N7→YES sequence, the
+user reported the physical Sharp display looked blank and asked
+whether that was expected. Rather than guess, checked `hdw.lcd_base_addr`/
+`lcd_line_offset`/`lcd_menu_addr`/`lcd_vlc` directly (all real,
+non-zero, sane values - the LCD controller genuinely had been
+configured by the ROM) and then directly sampled 200 nibbles of the
+actual emulated LCD pixel memory at `lcd_base_addr` via
+`bus_fetch_nibble()` - **0 of 200 nonzero**, the exact same signature
+(same methodology, same conclusion) as the 2026-08-19 "Timer-driven
+execution" section's own "0 of 340 sampled nibbles nonzero... a
+genuinely blank emulator LCD buffer, correctly rendered as blank, not
+a render bug" finding. A blank stack display after answering a
+memory-recovery prompt on a calculator with genuinely empty RAM is
+real, expected HP48SX behavior, not a symptom of anything wrong.
+
+**Net result: the YES-path `cache__flush_except()` use-after-free bug
+first found on 2026-08-21 is fixed, validated on the host across 63
+million instructions and six real keypresses, and confirmed on real
+hardware** - sustained multi-hundred-million-iteration execution, a
+real YES press (plus NO and neutral presses) processed cleanly with
+no bad opcode, no crash, and correct (verified, not assumed) display
+behavior throughout. `saturn_core.patch` now carries three
+coordinated, dated, cross-referenced hunks (the pre-existing
+`N_PORT_2_BANK_48` fix, the `cache__flush_except`/`ref_count` fix,
+and the `N_ROM_SIZE_48` right-sizing); `firmware/main.c` carries the
+`PSRAM_TRACE_SIZE` shrink. Worth remembering for future SWD sessions:
+prefer OpenOCD's own `resume` (via telnet, port 4444) over GDB's
+`detach` when a script needs to reliably hand control back to a
+free-running target - this session lost real time to that gap before
+finding it.
 
 ## ROM images — bring your own
 

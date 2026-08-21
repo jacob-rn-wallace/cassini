@@ -196,7 +196,13 @@ static void FlashLogAppend( const char* line )
  * fast RAM write, no erase, no program-time delay) and only touches
  * flash once, reactively, via FlushTraceToFlash() below, well after
  * the timing-sensitive window has already passed. */
-#define PSRAM_TRACE_SIZE ( 512 * 1024 )
+/* 2026-08-21, Cassini patch: shrunk from 512 KiB to match
+ * FLASH_LOG_SIZE exactly - FlushTraceToFlash() already clamps to
+ * FLASH_LOG_SIZE (64 KiB) when persisting, so anything beyond the
+ * last 64 KiB in this circular buffer was already unreachable/unused.
+ * Freed for the option-3 ref_count fix's real PSRAM budget - see
+ * CLAUDE.md's write-up. */
+#define PSRAM_TRACE_SIZE FLASH_LOG_SIZE
 static char* psram_trace = NULL;
 static size_t psram_trace_pos = 0;
 
