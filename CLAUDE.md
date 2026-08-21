@@ -141,9 +141,15 @@ the vendored core's `USE_BUS_CACHE` logic
 `bus_map_t` structures without checking their own `ref_count` field,
 despite that field's whole documented purpose being to prevent exactly
 that) — confirmed live via a hardware watchpoint reproduction, not
-just static reading. Not yet fixed (candidate fixes recorded, none
-chosen/applied — this is vendored code, so any fix needs the same
-explicit approval the project's one existing `saturn_core.patch` got).
+just static reading. **One candidate fix (gate the `free()` on
+`ref_count`) was tried the same day and reverted the same day** — it
+caused a worse, faster-onset regression (unbounded PSRAM heap growth
+past the physical 8 MiB chip, within seconds of boot, since
+`ref_count` is never decremented anywhere in the vendored core) rather
+than actually fixing anything. Reverted; back to the known-good
+baseline, bug still present. Still not fixed — this is vendored code,
+so any real fix needs the same explicit approval the project's one
+existing `saturn_core.patch` got.
 See "SWD bring-up completed, and the real root cause found" (also
 under "Native firmware" below) for the full account.
 
@@ -1796,6 +1802,85 @@ reset exit"` - notable in its own right, since this bypasses
 board wedged in a fault/lockup state has already been observed to be
 USB-unreachable for `picotool -f` (`bfar`/lockup investigation,
 2026-08-19 above) but remains fully reachable over SWD regardless.
+
+### Fix attempt #1 tried and reverted same day: gating the free() on `ref_count` causes unbounded PSRAM growth, not a real fix
+
+Same session, immediately after picking the "respect `ref_count`"
+option from the three candidates above. Applied it as a second hunk in
+`saturn_core.patch` (`cache__flush_except()`'s `free( p )` gated behind
+`p->cache.ref_count == 0`), verified the change couldn't break the
+caller's retry logic first (`cache__select_config_victim()`'s
+`retry` path only needs `BUS_MAP.cache.config[]` cleared, which
+`cache__clear_info_of(save)` does unconditionally regardless of how
+much this loop actually frees - confirmed by direct reading, not
+assumed), rebuilt clean, reflashed over SWD. **This was wrong in
+practice, caught live, and reverted the same session - worth recording
+in full since the mistake itself is instructive.**
+
+First symptom: `picotool`/OpenOCD reported `clearing lockup after
+double fault` immediately after the post-flash reset - initially
+unclear if related to the fix or just SWD/reset-sequence noise from
+back-to-back program+reset cycles. A follow-up `monitor reset halt`
+cleared it and looked stable. Real symptom, reported by the user after
+a genuine power cycle (not just an SWD reset): the physical Sharp
+display showed early boot text correctly, then garbage, then went
+blank - a new failure mode never seen in this project before.
+
+**Live SWD investigation initially misread this as a display/SPI
+hardware bug, not a Saturn-core issue.** Repeated `attach`/halt cycles
+consistently landed inside `spi_write_blocking()` (from the vendored
+`sharpdisp` library, called via `sharpdisp_refresh_vscroll()`), at the
+identical instruction address across independent halts separated by
+real wall-clock gaps, with the row-loop's `y` local frozen at `1`
+across an 8-second window - genuine non-progress, not sampling bias
+from a hot path. Direct `SSPSR` register reads showed `BSY=0`
+(not-busy) each time, which was momentarily confusing (seemingly
+contradicting a busy-wait hang) but turned out to be a red herring
+once the real cause was found.
+
+**Real root cause, confirmed by direct arithmetic**: `bus_map_ptr`/
+`cache_head` had reached `0x11881448` - **517 KB *past* the actual end
+of the Pico Plus 2's 8 MiB PSRAM window** (`0x11000000` +
+`8*1024*1024` = `0x11800000`), reached within seconds of boot, before
+any keypress. Since `ref_count` is never decremented anywhere in the
+vendored core (confirmed repeatedly this session), "only free
+unreferenced nodes" in practice meant "almost never free anything" -
+`cache__flush_except()` kept the underlying newlib heap (PSRAM-backed,
+`CASSINI_PSRAM_HEAP`) bump-allocating straight past the physical chip
+boundary far faster than expected. This directly invalidates this
+write-up's own earlier estimate ("PSRAM has room for ~20-25 more such
+structs") - wrong by a large margin; referenced-node retention
+happens far more often in real execution than that estimate modeled.
+Accessing heap memory beyond the real PSRAM chip via the RP2350's QMI
+peripheral is a very plausible, though not exhaustively proven,
+explanation for a genuine bus-level stall rather than a clean fault -
+consistent with everything observed (no `HardFaultHandlerC` catch, no
+bad-opcode signal, just a frozen `y` and a wedged SPI call).
+
+**Reverted immediately** - `cache__flush_except()`'s `free()` call is
+back to its original, unconditional form (`if ( p != save ) free( p
+);`), `saturn_core.patch` regenerated to contain only the original
+`N_PORT_2_BANK_48` hunk again. Rebuilt, reflashed over SWD, and
+confirmed on real hardware: back to the known-good "Try to Recover
+Memory?" prompt rendering normally. **The YES-path use-after-free bug
+documented above is, as a direct consequence, unfixed again** - this
+session ends with the root cause fully identified and confirmed (see
+above) but no working fix yet applied.
+
+**What this means for the three candidate fixes recorded earlier**:
+option 1 (respect `ref_count`) is not viable as written - it needs to
+be paired with something that actually *bounds* total retained memory,
+since nothing in this design ever un-references a node once
+referenced. Option 2 (make the flush a no-op, let genuine exhaustion
+hit `FATAL0(BUS_F_NO_VICTIM)` cleanly) has the same underlying
+unbounded-retention problem and was never actually tried, but should
+now be expected to fail the same way, for the same reason, on the same
+timescale. **Option 3 - actually implementing `ref_count` decrementing
+to match the field's original documented intent - now looks like the
+only one of the three that can work at all**, since it's the only one
+that keeps genuinely-dead structures reclaimable. Left open for a
+future session, deliberately not attempted today given how quickly
+option 1's simpler version already went wrong.
 
 ## ROM images — bring your own
 
