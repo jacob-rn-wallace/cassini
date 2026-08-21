@@ -2114,6 +2114,102 @@ prefer OpenOCD's own `resume` (via telnet, port 4444) over GDB's
 free-running target - this session lost real time to that gap before
 finding it.
 
+### New open item found the same day, after the fix was confirmed: the CPU appears permanently stuck inside its own interrupt handler
+
+Same 2026-08-21 session, immediately after the hardware confirmation
+above. Attempted a real calculator test - answer the recovery prompt,
+then enter `2 ENTER 3 +` over the USB-serial keyboard bridge - to
+validate actual calculator functionality, not just crash-freedom. The
+physical display stayed blank throughout, including for the isolated
+digit `2` alone. The user's own clarifying testimony matters here:
+across every session of this whole project, the *only* thing ever
+seen on the physical display besides boot text has been the "Try to
+Recover Memory?" prompt itself - never a working, interactive ready
+state. This is evidence the gap predates today's session entirely,
+not something introduced by it.
+
+**Two real methodology mistakes made and corrected during this
+investigation, kept on record since they'll recur:**
+- A `main_loop_progress` reading went *backward* between two checks
+  (443,714,038 down to 40,903,411) - impossible for a monotonic
+  counter, and traced to a real cause: an overly broad LCD-memory
+  probe script (3500 individual `bus_fetch_nibble()` remote calls,
+  each a full inferior-function-call round trip over SWD) ran for a
+  full 2 minutes before being killed, holding the ARM core
+  continuously debug-halted that whole time. No hardware watchdog is
+  configured in this firmware (checked directly), so the exact
+  mechanism isn't fully pinned down, but the timing correlation is
+  strong and a real, unexplained board reset is the most likely
+  explanation - a caution for future sessions to keep SWD probes
+  short and bounded, mirroring the project's own Power-of-10
+  discipline for its own code.
+- A "found real content" reading (`lcd_base_addr + 2000`, 62/100
+  nonzero) turned out to be a red herring - that offset is past what
+  `saturn_lcd_render()`'s main-region loop ever actually reads (56
+  rows × `SATURN_LCD_NIBBLES_PER_ROW` = 1904 nibbles max from
+  `lcd_base_addr`, confirmed by reading `firmware/saturn_lcd.c`
+  directly), so it was very likely unrelated RAM content, not real
+  LCD data. Re-checking the actually-rendered ranges (remaining main
+  rows, and the real `lcd_menu_addr` region) showed genuinely,
+  consistently blank content instead - resolving one thread of the
+  investigation (the render pipeline is not the bug; `disp_buffer`,
+  the real SPI-transferred framebuffer, was also confirmed
+  byte-for-byte `0xFF` i.e. genuinely blank across its full range,
+  consistent with genuinely-blank source data, not a decode/blit
+  failure).
+
+**The real, well-evidenced finding.** Checked `cpu.int_service`
+directly via SWD: **`true`**, with `cpu.pc` sitting at `0x1` - deep
+inside the interrupt handler's own code, not normal top-level
+execution. Confirmed this isn't a momentary snapshot artifact: a lone
+breakpoint set on RTI's own "clean return" branch
+(`cpu.c:1400`, `cpu.int_service = false; cpu.pc = rstk_pop();`) and a
+second on its "re-vector immediately" branch (`cpu.c:1395`) - together,
+every way `cpu.int_service` can ever change - **neither fired once in
+15 real seconds** of confirmed-still-executing main-loop time. This
+means the CPU isn't failing to *complete* RTI; it never reaches the
+RTI opcode's dispatch case at all during that window. It's genuinely
+looping inside interrupt-handler code that never gets back to its own
+return instruction - which, mechanically, explains everything observed
+today: `main_loop_progress` keeps climbing (the outer `main()` loop,
+redraw/poll logic, and `OneStep()` calls all keep running normally),
+no bad opcode ever fires (the looping code is presumably valid Saturn
+instructions), PC visibly varies across samples (consistent with a
+real, non-trivial loop, not a single frozen instruction) - and every
+real keypress NMI this session ever sent just got silently queued into
+the single-slot `cpu.int_pending` (confirmed reading back
+`INT_REQUEST_NONE` between presses, i.e. already-serviced-or-
+overwritten) and never actually serviced, since servicing a pending
+request only happens at RTI (`cpu.c:1389-1395`), which never runs.
+
+**One real, concrete hypothesis investigated and disproven, not
+guessed away.** `firmware/main.c`'s own `TickTimers()` (Cassini's own
+code, not vendored) decrements `hdw.t2_val` every tick but never
+reloads it after the one-time underflow-triggered `T2_CTRL_SREQ`
+assertion - looked like a plausible bug (T2 could then only ever fire
+once, ever, for the whole session). **Checked directly against the
+vendored core's own reference `EmulatorLoop()`
+(`saturn_core/src/core/emulator.c:177-182`) before touching anything**:
+it uses the *exact same* decrement-then-check-for-`0xFFFFFFFF` pattern,
+with no reload either. This is faithful, reference-matching behavior,
+not a bug - the "fix" was not implemented, since doing so would have
+deviated from the authoritative reference for a change with no real
+evidence behind it. A real, cheap experiment that correctly avoided
+shipping a speculative, likely-wrong change - worth recording as a
+methodology win even though it didn't resolve the underlying issue.
+
+**Deliberately left open, not chased further this session** - fully
+root-causing *why* the ROM's interrupt handler never reaches its own
+RTI needs either disassembling the actual instruction loop at the
+stuck PC (the vendored core has a real disassembler, `disassembler.c`,
+2,331 lines, not yet used for this) or comparing against a reference
+implementation's (x48, or real hardware) exact interrupt/keyboard
+signaling contract - genuine further research, not a quick fix. A
+natural next step for a fresh session: use `disassembler.c` to decode
+the actual loop, or trace consecutive `cpu.pc` samples across many
+single-stepped `OneStep()` calls to map out the loop's exact address
+range and structure before speculating further about its cause.
+
 ## ROM images — bring your own
 
 **The ROM files themselves are not in this repo, and never should be.**
