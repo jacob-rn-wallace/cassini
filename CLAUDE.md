@@ -134,9 +134,18 @@ clickable HP48GX keyboard photo). Confirmed working end to end for a
 neutral key and for the recovery prompt's NO answer (including this
 project's own bad-opcode safety net catching a real vendored-core
 opcode gap cleanly); YES reaches the same gap but doesn't get caught
-by that same safety net, left open as a real next-session
-investigation. See "Interactive keyboard bridge" (also under "Native
-firmware" below) for the full account.
+by that same safety net. **Root-caused as of 2026-08-21**, once a
+working SWD debug probe made live reproduction possible: a real bug in
+the vendored core's `USE_BUS_CACHE` logic
+(`saturn_core/src/core/bus.c`'s `cache__flush_except()` frees cached
+`bus_map_t` structures without checking their own `ref_count` field,
+despite that field's whole documented purpose being to prevent exactly
+that) — confirmed live via a hardware watchpoint reproduction, not
+just static reading. Not yet fixed (candidate fixes recorded, none
+chosen/applied — this is vendored code, so any fix needs the same
+explicit approval the project's one existing `saturn_core.patch` got).
+See "SWD bring-up completed, and the real root cause found" (also
+under "Native firmware" below) for the full account.
 
 ## Coding standard: NASA/JPL "Power of 10"
 
@@ -1506,6 +1515,258 @@ this needs either much more careful manual call-sequence modeling, or
 (more likely to actually resolve it) a live watchpoint on
 `ref_count`/`.cache.config[]` writes during a real YES-path run - a
 natural, concrete use for the SWD probe once wired up.
+
+### SWD bring-up completed, and the real root cause found: `cache__flush_except()` frees referenced structures, 2026-08-21
+
+Two sessions later. Resumed exactly where the prior session paused
+(mid-guesswork on probe-to-target wiring), and closed out both open
+threads from that session in one sitting: the SWD link itself, and -
+using it for real, live reproduction for the first time - the actual
+root cause of the YES-path bug, superseding the "real ref_count design
+gap... not yet a proven root cause" conclusion above with a fully
+source-confirmed mechanism.
+
+**SWD wiring resolved.** None of the four wiring hypotheses from the
+prior session's final debugging pass were actually the problem - the
+real culprit was a fragile two-halves splice (two separate JST-SH-to-
+bare-wire cable stubs joined through shared breadboard holes, since
+the cables available only had a connector on one end). Continuity had
+checked out with a multimeter, but the splice still didn't carry a
+clean SWD signal. Fixed by using a single continuous wire instead -
+JST-SH connector on one end (into the Pico Plus 2's target `DEBUG`
+connector), bare pins on the other (direct into the probe Pico 2's
+breadboarded GP2/GP3/GND legs) - eliminating the splice entirely.
+First connection attempt after rewiring succeeded immediately:
+
+```
+Info : SWD DPIDR 0x4c013477 DPv3
+Info : [rp2350.cm0] Cortex-M33 r1p0 processor detected
+Info : [rp2350.cm0] target has 8 breakpoints, 4 watchpoints
+Info : [rp2350.cm0] Examination succeed
+Info : [rp2350.cm1] Cortex-M33 r1p0 processor detected
+```
+
+Both RP2350B cores examined cleanly, GDB server up on port 3333. The
+color/pin mapping that actually worked, for the record: red -> SWDIO,
+yellow -> SWCLK, black -> GND, probe-side GP3/GP2/GND respectively -
+confirmed by multimeter continuity in the prior session and unchanged
+here, only the splice topology changed.
+
+**First real discovery, before any deliberate reproduction attempt:
+the board had been frozen in the corrupted state since 2026-08-19,
+never power-cycled across two full sessions.** The very first `attach`
++ `continue` landed almost immediately in `BadOpcodeHandler`, with
+`bus_map_ptr == cache_head == 0x117c1220` and garbage
+`ref_count`/`config_point` fields - and `0x117c1220` is the *exact*
+value the `HARDFAULT ... r1=117C1220` trace line from the
+2026-08-19 hard-fault session captured. The board had simply been
+sitting powered, either wedged in the bad-opcode cascade or having
+already reached the post-fault silent-halt loop, for two days. This
+made the first "reproduction" not a fresh repro at all - it was
+inspecting a two-day-old frozen crash. Establishing this mattered: it
+meant a real fresh reproduction needed an explicit SWD-level reset
+first (`monitor reset halt`), not just an attach.
+
+**Two real OpenOCD/GDB mechanics learned the hard way, worth recording
+since they'll recur:**
+- **A single hardware breakpoint on a flash (read-only) address plus a
+  single hardware watchpoint could not be inserted simultaneously** on
+  this rp2350/CMSIS-DAP OpenOCD configuration, despite the target
+  reporting "8 breakpoints, 4 watchpoints" available - `Could not
+  insert hardware watchpoint 1` / `You may have requested too many
+  hardware breakpoints/watchpoints` fired even with just one of each.
+  A *lone* watchpoint (no breakpoint at all) inserted fine. Not fully
+  root-caused (possibly a real comparator-sharing constraint on this
+  chip/OpenOCD version, possibly dual-core resource accounting - both
+  cm0 and cm1 get examined even though only cm0 runs real firmware),
+  but the practical workaround was simply to drop the flash breakpoint
+  and rely on the watchpoint alone, plus this project's own existing
+  flash-persisted fault log for the detail a `HardFaultHandlerC`
+  breakpoint would otherwise have given live.
+- **Hardware watchpoints must be inserted while the target is halted,
+  not while it's free-running.** An initial attempt to `monitor reset
+  run` (reset + immediately resume) and then set a watchpoint a few
+  seconds later, while the target was actively executing, failed the
+  same "could not insert" way even with only one watchpoint requested.
+  Switching to `monitor reset halt` (reset, stay halted) - set the
+  watchpoint - *then* `continue` fixed it immediately and reliably.
+
+**Live reproduction, this time genuinely fresh.** After a clean
+`reset halt` + `watch cache_head` + `continue`, `cache_head` (the
+global head of `saturnng`'s cached-`bus_map_t` linked list,
+`saturn_core/src/core/bus.c:20004a50` in this build) advanced through
+a real, legible sequence of live `bus_map__new()` allocations during
+boot - climbing through 8 distinct addresses roughly `0x40058` bytes
+apart (matching `sizeof(bus_map_t)` in this PSRAM-heap build), with
+some genuine early recycling among 3-4 of them, all captured with full
+backtraces resolving cleanly to `bus_configure()`/`bus_unconfigure()`
+call sites in the vendored, unmodified core. A real YES keypress (`0x14`)
+was then sent over the existing USB-serial keyboard bridge (the
+correct port identified as `/dev/tty.usbmodem1401`, distinguished from
+the debug probe's own separate USB-serial enumeration by product name
+via `ioreg -p IOUSB -w0 -l`, and confirmed live by echoing a debug
+line back for a neutral test press first). `cache_head` kept climbing
+- entirely through fresh, never-reused addresses from that point on -
+until it reached `0x117c1220` again: **the same address the frozen
+two-day-old crash was sitting on**, now reached via a real, watched,
+live run. Watchpoint hits then stopped entirely; interrupting the GDB
+session confirmed the target was halted inside `HardFaultHandlerC`'s
+own terminal loop (`main.c:333` at the time) - a genuine, live,
+debugger-observed reproduction of the crash, not an inference from a
+frozen board or a flash-log post-mortem.
+
+**Root cause, fully confirmed by direct source reading - not just
+correlated with the crash address.** `saturn_core/src/core/bus.h:342-344`
+documents `ref_count`'s intended purpose plainly: "incremented by one
+when the `bus_map_t` is referenced by an unconfig link; ... used to
+avoid freeing referenced structures." A complete grep of every
+`ref_count` reference in `bus.c` (re-verified this session, five
+hits total, matching the prior session's own count exactly) shows:
+- Reset to `0` only in `cache__clear_info_of()` (`bus.c:358`), run on
+  every newly-allocated or newly-recycled node.
+- Incremented in exactly two places: `bus_configure()` (`bus.c:1143`,
+  `old->cache.ref_count++`) and `bus_unconfigure()`'s late-hit path
+  (`bus.c:1251`, `nxt->cache.ref_count++`) - both exactly where the
+  prior session's static analysis already found them.
+- **Read/checked in exactly one place**: `cache__select_config_victim()`
+  (`bus.c:631`), as the sole gate on whether a config-cache slot is
+  "safe to recycle."
+- **Never decremented anywhere in the file.** Confirmed again, freshly,
+  this session.
+
+`N_BUS_CACHE_ENTRIES` is `8` (`bus.h:205`) - small, and since
+`ref_count` only ever grows, ordinary execution routinely exhausts
+every recyclable slot in whichever `bus_map_t` is currently active
+(any node that has ever been referenced by so much as one unconfig
+link, which is the *common* case, becomes permanently unrecyclable).
+When `cache__select_config_victim()`'s search fails outright, its
+documented `retry` behavior (`bus.c:640-644`) is:
+
+```c
+if ( retry ) {
+    WARNING0( BUS_CHF_MODULE_ID, BUS_W_NO_VICTIM )
+    cache__flush_except( bus_map_ptr );
+    victim = cache__select_config_victim( 0 );
+}
+```
+
+**And `cache__flush_except()` (`bus.c:500-517`) is the actual bug -
+it unconditionally `free()`s every cached `bus_map_t` except the one
+passed in, with zero check of `ref_count` at all:**
+
+```c
+static void cache__flush_except( bus_map_t* save )
+{
+    bus_map_t* n;
+    bus_map_t* p = cache_head;
+    while ( p != ( bus_map_t* )NULL ) {
+        n = p->cache.link;
+        if ( p != save )
+            free( p );          /* <-- no ref_count check, ever */
+        p = n;
+    }
+    save->cache.link = ( bus_map_t* )NULL;
+    cache_head = save;
+    cache__clear_info_of( save );
+}
+```
+
+This directly contradicts `ref_count`'s own documented invariant. Any
+node freed here that is *still* reachable through some *other* node's
+`.cache.unconfig[]` array (exactly the case `ref_count > 0` exists to
+flag) is freed anyway, leaving that other node holding a dangling
+pointer. `cache__unconfig_get()` (`bus.c:576-582`, the function the
+2026-08-19 hard-fault session's `addr2line` trace already pinned as
+the actual fault site) walks precisely these `.cache.unconfig[]`
+chains and dereferences whatever the freed memory now holds - a
+textbook use-after-free, and (with a PSRAM heap that readily reuses
+freed blocks) the exact mechanism that produces both previously
+observed failure modes: a corrupted-but-still-executable pointer chain
+(the long repeating bad-opcode cascade, since reused memory
+occasionally still decodes as a semi-plausible `bus_map_t`) and a
+fully garbage pointer eventually leading to a real BusFault (the
+`bfar=0x736C20D4`-style captures from the 2026-08-19 session).
+
+**This also explains, precisely, several previously-open questions:**
+- **Why YES corrupts and NO doesn't.** NO's recovery-prompt code path
+  hits its own separate, already-understood bad-opcode gap almost
+  immediately and stops cleanly; YES's softkey dispatch does enough
+  *additional* `bus_configure()`/`bus_unconfigure()` churn on the way
+  to actually exhaust all 8 cache-recyclable slots and trigger
+  `cache__flush_except()` - a difference in configure/unconfigure
+  *call volume*, not in which opcode gap gets hit first.
+- **Why a fixed-instruction-count host warmup never reproduced it**
+  (the dead end documented in the 2026-08-19 investigation above): the
+  bug depends on real configure/unconfigure call *volume* exhausting
+  ref-counted slots, not on raw instruction count or elapsed time -
+  the host tool's fixed-2,000,000-instruction warmup had no reason to
+  land on a state anywhere near cache exhaustion.
+- **Why the prior session's "self-aliasing victim" theory didn't pan
+  out.** Re-traced this session, carefully: `cache__clear_info_of()`
+  always wipes a struct's *own* cache table (via `bus_map__copy()`)
+  before that struct can become the newly active `bus_map_ptr`, and
+  every write to a `.cache.config[]` slot always stores a *different*
+  struct's address, never the currently-active node's own address. The
+  self-referential-victim path traced through carefully and does not
+  appear reachable - a real negative result, now superseded by the
+  `cache__flush_except()` finding, which needed no such aliasing at
+  all to be a bug.
+
+**Confidence level: very high, source-confirmed, but not yet caught
+"on camera" mid-free.** The live watchpoint run caught `cache_head`
+reaching the known-bad address and the target going silent/faulting
+immediately after - consistent with, but not a frame-by-frame capture
+of, `cache__flush_except()` itself executing. A cheap, natural next
+step (now that live watchpoints work reliably) is a lone breakpoint on
+`cache__flush_except` itself (one hardware resource, avoiding the
+breakpoint+watchpoint conflict noted above) to catch the exact moment
+it runs and confirm the freed-node/dangling-pointer chain directly.
+
+**Not yet fixed, and deliberately not touched unilaterally** - this is
+a real bug in the vendored, never-edited `saturnng` core, so any fix
+needs the same explicit approval this project's one existing patch
+(`saturn_core.patch`, the `N_PORT_2_BANK_48` fix) already got, tracked
+the same way. Candidate fixes, recorded for a future decision, not
+chosen yet:
+1. **Make `cache__flush_except()` actually respect `ref_count`** (skip
+   `free()`-ing referenced nodes). Closest to a minimal patch, but
+   risks just moving the bug: a "partial" flush that still finds no
+   victim falls through to `cache__select_config_victim(0)`'s
+   `FATAL0( BUS_F_NO_VICTIM )` path - trading silent corruption for a
+   different, currently-untested failure mode.
+2. **Make the flush a no-op (or free nothing conditionally)** and let
+   victim-exhaustion hit `BUS_F_NO_VICTIM` directly - a loud, clean
+   Chf `FATAL` (which this project's shim already handles as a
+   controlled `exit()`/reset path) instead of silent memory
+   corruption. Simple, but only reasonable if genuine victim
+   exhaustion turns out to be rare in real usage once `ref_count`
+   properly gates recycling - not yet verified.
+3. **Actually implement reference counting properly** (decrement when
+   an unconfig link is itself superseded/overwritten) - the fix that
+   matches `ref_count`'s original documented intent most closely, but
+   the most invasive of the three, and the hardest to justify as "one
+   narrow patch" under this project's vendoring discipline.
+
+Also worth a future decision, not made here: this is upstream
+`saturnng`'s own bug (present in the pinned `3f467d2` commit, nothing
+Cassini introduced), so reporting it upstream at
+`codeberg.org/gwh/saturnng` is a real option once a fix is chosen and
+verified - a call for the user to make, not assumed.
+
+**Also this session: the LED heartbeat and HardFault fast-blink were
+removed from `firmware/main.c`.** With a debug probe now reliably
+attached, the physical LED signal (added purely so the board's state
+was visible without a debugger) is redundant, and the fast-blink-on-
+fault pattern was unpleasantly bright/rapid in practice. `LedHeartbeat()`
+keeps its stall-detection/flash-flush watchdog logic (still real and
+still needed) but no longer calls `gpio_put()`; `HardFaultHandlerC()`'s
+terminal loop is now a silent `for(;;){}`. Rebuilt clean and reflashed
+directly over SWD via `openocd ... -c "program cassini.elf verify
+reset exit"` - notable in its own right, since this bypasses
+`picotool`/USB-BOOTSEL entirely, which matters specifically because a
+board wedged in a fault/lockup state has already been observed to be
+USB-unreachable for `picotool -f` (`bfar`/lockup investigation,
+2026-08-19 above) but remains fully reachable over SWD regardless.
 
 ## ROM images — bring your own
 

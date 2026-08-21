@@ -326,12 +326,11 @@ static void __attribute__( ( noreturn, used ) ) HardFaultHandlerC( uint32_t* sta
     DumpCpuState( "FAULT-saturn", 0 );
     FlushTraceToFlash();
 
-    for ( ;; ) {
-        gpio_put( PICO_DEFAULT_LED_PIN, true );
-        for ( volatile uint32_t i = 0; i < 500000; i++ ) { }
-        gpio_put( PICO_DEFAULT_LED_PIN, false );
-        for ( volatile uint32_t i = 0; i < 500000; i++ ) { }
-    }
+    /* LED blink removed - a debug probe is now attached for this
+     * project's whole SWD bring-up phase, making the visual signal
+     * redundant and, at full brightness, unpleasant. Halt silently;
+     * the probe can see the halted PC/registers directly. */
+    for ( ;; ) { }
 }
 
 /* TEMPORARY diagnostic - overrides crt0.S's weak isr_hardfault stub
@@ -447,9 +446,8 @@ static volatile long main_loop_progress = 0;
 static bool LedHeartbeat( struct repeating_timer* t )
 {
     (void)t;
-    static bool led_on = false;
-    led_on = !led_on;
-    gpio_put( PICO_DEFAULT_LED_PIN, led_on );
+    /* GPIO toggle removed (see HardFaultHandlerC) - only the stall
+     * watchdog below still matters now that a debug probe is attached. */
 
     static long last_seen_progress = -1;
     static int stall_ticks = 0;
