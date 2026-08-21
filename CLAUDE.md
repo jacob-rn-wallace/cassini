@@ -1712,15 +1712,44 @@ fully garbage pointer eventually leading to a real BusFault (the
   `cache__flush_except()` finding, which needed no such aliasing at
   all to be a bug.
 
-**Confidence level: very high, source-confirmed, but not yet caught
-"on camera" mid-free.** The live watchpoint run caught `cache_head`
-reaching the known-bad address and the target going silent/faulting
-immediately after - consistent with, but not a frame-by-frame capture
-of, `cache__flush_except()` itself executing. A cheap, natural next
-step (now that live watchpoints work reliably) is a lone breakpoint on
-`cache__flush_except` itself (one hardware resource, avoiding the
-breakpoint+watchpoint conflict noted above) to catch the exact moment
-it runs and confirm the freed-node/dangling-pointer chain directly.
+**Confirmed directly, "on camera," immediately after writing the above.**
+`cache__flush_except` is `static` and gets inlined at `-O3` (no symbol
+of its own in `nm`), but a line breakpoint at its `free( p );` call
+(`bus.c:510`) still resolved correctly via debug info (two inlined
+locations, same pattern already seen with `BadOpcodeHandler`) and fired
+live, within the first ~4 seconds of a cold `reset halt` + `continue` -
+no YES keypress even needed for this particular hit. Two consecutive
+hits during ordinary early-boot execution:
+
+```
+FLUSH-FREE p=0x112c03c0 save=0x11300478 ref_count=1 config_point=0
+#0  cache__flush_except (...) at bus.c:510
+#1  bus_reset () at bus.c:1000
+#2  ... OneStep () at cpu.c:2517
+#3  ... main () at main.c:670
+
+FLUSH-FREE p=0x11280308 save=0x11300478 ref_count=1 config_point=1
+#0  cache__flush_except (...) at bus.c:510
+#1  bus_reset () at bus.c:1000
+...
+```
+
+Both freed nodes had `ref_count == 1` at the moment of the `free()` -
+by the field's own documented definition, that means each was, at that
+exact instant, still linked into some *other* node's `.cache.unconfig[]`
+array. This is the bug caught directly, not inferred. It also surfaces
+a **third call site**, more easily/frequently triggered than the
+cache-exhaustion victim-retry path this write-up otherwise focuses on:
+`bus_reset()` (`bus.c:1000`) calls `cache__flush_except( bus_map_ptr )`
+**unconditionally, on every reset** (`#ifdef USE_BUS_CACHE`, no
+`ref_count` check there either) - and `bus_reset()` itself runs on
+completely ordinary paths this project already relies on and documents
+elsewhere (cold boot, and the WARNING-then-`CpuReset()` fallback
+`EmulatorInit()` takes on missing optional state). So the unconditional
+free isn't gated behind rare cache exhaustion alone; a plain reset hits
+the identical bug by a shorter, more common path. Confidence: no longer
+just "very high" - this is a directly observed use-after-free setup,
+twice, with concrete addresses and nonzero `ref_count` values in hand.
 
 **Not yet fixed, and deliberately not touched unilaterally** - this is
 a real bug in the vendored, never-edited `saturnng` core, so any fix
